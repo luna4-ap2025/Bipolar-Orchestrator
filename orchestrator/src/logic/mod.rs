@@ -1,0 +1,192 @@
+//! # Game logic controller
+//!
+//! The **logic loop** is the autonomous heartbeat of the game. Once started it
+//! runs in a dedicated background thread and:
+//!
+//! 1. **Ticks** a configurable interval (default: 1 second).
+//! 2. For each alive planet, rolls a die against its probability curve and sends
+//!    either a [`Sunray`] or an [`Asteroid`].
+//! 3. Waits for the planet's acknowledgment.
+//! 4. If an [`AsteroidAck`] carries `rocket: None`, the planet is destroyed:
+//!    - Sends [`KillPlanet`] and removes it from all registries.
+//!    - Notifies the [`ProbabilityRegistry`] to trigger the bipolar flip.
+//!    - Notifies the [`Topology`] to remove the dead planet.
+//! 5. Can be stopped and restarted at any time via [`LogicController::stop`] /
+//!    [`LogicController::start`].
+//!
+//! ## Owner: Vivi
+
+pub mod event_handler;
+pub mod tick;
+
+use crate::error::OrchestratorError;
+use crate::explorer::ExplorerRegistry;
+use crate::galaxy::Topology;
+use crate::planet::PlanetRegistry;
+use crate::probability::ProbabilityRegistry;
+use common_game::protocols::orchestrator_explorer::OrchestratorToExplorer;
+use common_game::protocols::orchestrator_planet::PlanetToOrchestrator;
+use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// How often the logic loop ticks (1 second per tick).
+const TICK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Signal sent to the logic thread to control it.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum ControlSignal {
+    Stop,
+}
+
+/// Controls the autonomous game logic thread.
+///
+/// [`LogicController::start`] launches a background thread. [`LogicController::stop`]
+/// sends a stop signal and waits for it to finish.
+pub struct LogicController {
+    /// Channel end for sending stop signals to the logic thread.
+    control_tx: Option<Sender<ControlSignal>>,
+    /// Join handle for the background thread.
+    thread_handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LogicController {
+    /// Creates a new (stopped) controller.
+    pub fn new() -> Self {
+        Self {
+            control_tx: None,
+            thread_handle: None,
+        }
+    }
+
+    /// Returns `true` if the logic loop is currently running.
+    pub fn is_running(&self) -> bool {
+        self.control_tx.is_some()
+    }
+
+    /// Starts the logic loop in a background thread.
+    ///
+    /// The loop has access to the shared game state via `Arc<Mutex<...>>` wrappers.
+    ///
+    /// # Errors
+    /// Returns [`OrchestratorError::InvalidState`] if already running.
+    pub fn start(
+        &mut self,
+        topology: Arc<Mutex<Topology>>,
+        planets: Arc<Mutex<PlanetRegistry>>,
+        explorers: Arc<Mutex<ExplorerRegistry>>,
+        prob_registry: Arc<Mutex<ProbabilityRegistry>>,
+        planet_rx: Arc<Mutex<Receiver<PlanetToOrchestrator>>>,
+    ) -> Result<(), OrchestratorError> {
+        if self.is_running() {
+            return Err(OrchestratorError::InvalidState(
+                "Logic is already running".to_string(),
+            ));
+        }
+
+        let (control_tx, control_rx) = bounded::<ControlSignal>(1);
+
+        let handle = std::thread::Builder::new()
+            .name("bipolar-logic".to_string())
+            .spawn(move || {
+                run_logic_loop(
+                    topology,
+                    planets,
+                    explorers,
+                    prob_registry,
+                    planet_rx,
+                    control_rx,
+                );
+            })
+            .map_err(|e| OrchestratorError::InvalidState(e.to_string()))?;
+
+        self.control_tx = Some(control_tx);
+        self.thread_handle = Some(handle);
+        log::info!("Logic loop started");
+        Ok(())
+    }
+
+    /// Stops the logic loop and waits for the thread to finish.
+    ///
+    /// # Errors
+    /// Returns [`OrchestratorError::InvalidState`] if not running.
+    pub fn stop(&mut self) -> Result<(), OrchestratorError> {
+        let tx = self.control_tx.take().ok_or_else(|| {
+            OrchestratorError::InvalidState("Logic is not running".to_string())
+        })?;
+
+        // send stop signal (ok if it fails, thread may have exited already)
+        let _ = tx.send(ControlSignal::Stop);
+
+        if let Some(handle) = self.thread_handle.take() {
+            if let Err(e) = handle.join() {
+                log::error!("Logic thread panicked: {e:?}");
+            }
+        }
+
+        log::info!("Logic loop stopped");
+        Ok(())
+    }
+}
+
+impl Default for LogicController {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The main body of the logic loop thread.
+///
+/// Runs until a [`ControlSignal::Stop`] is received or all planets are dead.
+fn run_logic_loop(
+    topology: Arc<Mutex<Topology>>,
+    planets: Arc<Mutex<PlanetRegistry>>,
+    explorers: Arc<Mutex<ExplorerRegistry>>,
+    prob_registry: Arc<Mutex<ProbabilityRegistry>>,
+    planet_rx: Arc<Mutex<Receiver<PlanetToOrchestrator>>>,
+    control_rx: Receiver<ControlSignal>,
+) {
+    use rand::Rng;
+    let mut rng = rand::rng();
+
+    loop {
+        // check if we got a stop signal before doing anything this tick
+        match control_rx.try_recv() {
+            Ok(ControlSignal::Stop) | Err(TryRecvError::Disconnected) => {
+                log::info!("Logic loop: stop signal received");
+                break;
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+
+        // advance the probability curves by one tick worth of time
+        let delta = TICK_INTERVAL.as_secs_f64();
+        if let Ok(mut prob) = prob_registry.lock() {
+            prob.tick(delta);
+        }
+
+        // snapshot the alive planet ids while holding the lock, then release it
+        // so dispatch_to_planet can re-acquire it per planet
+        let planet_ids: Vec<_> = {
+            let topo = topology.lock().unwrap();
+            topo.planet_ids().collect()
+        };
+
+        if planet_ids.is_empty() {
+            log::info!("All planets destroyed - logic loop exiting");
+            break;
+        }
+
+        // for each alive planet, roll the dice and send sunray or asteroid
+        for planet_id in planet_ids {
+            // TODO(Vivi): call tick::dispatch_to_planet(...)
+            // it rolls sunray vs asteroid using prob_registry, sends the message,
+            // waits for the ack, and handles planet destruction if needed
+        }
+
+        // drain any messages from explorers that arrived autonomously this tick
+        // TODO(Vivi): call event_handler::drain_explorer_messages(...)
+
+        std::thread::sleep(TICK_INTERVAL);
+    }
+}
