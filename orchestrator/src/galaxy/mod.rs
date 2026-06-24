@@ -11,6 +11,8 @@
 //! ## Owner: Vale
 
 pub mod parser;
+pub mod planet_config;
 pub mod topology;
 
+pub use planet_config::PlanetConfigMap;
 pub use topology::Topology;

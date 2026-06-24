@@ -1,29 +1,65 @@
 //! # Bipolar Orchestrator - entry point
 //!
-//! Parses CLI arguments, reads the galaxy file, constructs the orchestrator,
-//! and hands control to the interactive API loop (or starts the logic immediately
-//! for automated runs).
+//! Parses CLI arguments, reads the galaxy and planet-config files, constructs
+//! the orchestrator, and hands control to the interactive API loop.
 //!
 //! ## Usage
 //! ```text
-//! bipolar-orchestrator --galaxy galaxy.txt [--auto]
+//! bipolar-orchestrator --galaxy galaxy.txt --planets planets.toml [--auto]
 //! ```
-//! - `--galaxy <path>` : path to the galaxy initialization file (required)
-//! - `--auto`          : immediately start the game logic without waiting for user input
+//! - `--galaxy <path>`  : path to the galaxy topology file (required)
+//! - `--planets <path>` : path to the planet factory config (required)
+//! - `--auto`           : immediately start the game logic without waiting for user input
 
+use bipolar_orchestrator::galaxy;
 use std::path::PathBuf;
 
 fn main() {
-    // TODO(both): initialize env_logger so tracing/log macros work
     env_logger::init();
 
     let args = parse_args();
 
-    log::info!("Starting Bipolar Orchestrator - galaxy file: {:?}", args.galaxy_path);
+    log::info!(
+        "Starting Bipolar Orchestrator - galaxy: {:?}, planets: {:?}",
+        args.galaxy_path,
+        args.planets_path
+    );
 
-    // TODO(Vale): call galaxy::parser::parse to load the topology
-    // TODO(Vivi): construct the OrchestratorApi from the parsed topology
-    // TODO(both): if args.auto_start, call api.start_logic() before entering the loop
+    // ── Load galaxy topology ──────────────────────────────────────────────────
+    let topology = match galaxy::parser::parse(&args.galaxy_path) {
+        Ok(t) => {
+            log::info!("Galaxy loaded: {} planets", t.planet_count());
+            t
+        }
+        Err(e) => {
+            eprintln!("Error loading galaxy file: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // ── Load planet factory mapping ───────────────────────────────────────────
+    let planet_config = match galaxy::planet_config::parse(&args.planets_path) {
+        Ok(c) => {
+            log::info!("Planet config loaded: {} entries", c.len());
+            c
+        }
+        Err(e) => {
+            eprintln!("Error loading planets config: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // ── Validate that every planet in the topology has a factory entry ────────
+    for id in topology.planet_ids() {
+        if !planet_config.contains_key(&id) {
+            eprintln!("Planet {id} is in galaxy.txt but has no entry in planets.toml");
+            std::process::exit(1);
+        }
+    }
+
+    // TODO(Vivi): construct OrchestratorApi::new(topology, planet_config, ...)
+    //             spawn planet threads, spawn explorer threads
+    // TODO(both): if args.auto_start, call api.start_logic() here
 
     interactive_loop();
 }
@@ -31,17 +67,19 @@ fn main() {
 /// Holds parsed CLI arguments.
 struct Args {
     galaxy_path: PathBuf,
+    planets_path: PathBuf,
     /// When true the game logic starts immediately without waiting for user input.
     auto_start: bool,
 }
 
-/// Minimal hand-rolled CLI parser (no external deps needed for two flags).
+/// Minimal hand-rolled CLI parser.
 ///
 /// # Panics
-/// Panics if `--galaxy` is not provided, as the game cannot run without a galaxy file.
+/// Panics if `--galaxy` or `--planets` is not provided.
 fn parse_args() -> Args {
     let mut args = std::env::args().skip(1);
     let mut galaxy_path: Option<PathBuf> = None;
+    let mut planets_path: Option<PathBuf> = None;
     let mut auto_start = false;
 
     while let Some(arg) = args.next() {
@@ -50,6 +88,10 @@ fn parse_args() -> Args {
                 let path = args.next().expect("--galaxy requires a file path argument");
                 galaxy_path = Some(PathBuf::from(path));
             }
+            "--planets" => {
+                let path = args.next().expect("--planets requires a file path argument");
+                planets_path = Some(PathBuf::from(path));
+            }
             "--auto" => auto_start = true,
             other => log::warn!("Unknown argument ignored: {other}"),
         }
@@ -57,6 +99,7 @@ fn parse_args() -> Args {
 
     Args {
         galaxy_path: galaxy_path.expect("--galaxy <path> is required"),
+        planets_path: planets_path.expect("--planets <path> is required"),
         auto_start,
     }
 }
