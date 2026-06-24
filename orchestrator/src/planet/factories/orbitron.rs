@@ -33,17 +33,12 @@ impl PlanetFactory for OrbitronFactory {
         tx_to_orchestrator: Sender<PlanetToOrchestrator>,
         rx_from_explorers: Receiver<ExplorerToPlanet>,
     ) -> Result<Planet, String> {
-        // TODO(Vale): call orbitron's public factory function.
-        // Example (adjust to actual API):
-        //
-        //   orbitron::create_planet(
-        //       id,
-        //       rx_from_orchestrator,
-        //       tx_to_orchestrator,
-        //       rx_from_explorers,
-        //   )
-        //
-        Err("Orbitron factory not implemented yet - fill in the create() body above".to_string())
+        Ok(orbitron::create_planet(
+            rx_from_orchestrator,
+            tx_to_orchestrator,
+            rx_from_explorers,
+            id,
+        ))
     }
 }
 

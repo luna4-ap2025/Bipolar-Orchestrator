@@ -15,14 +15,13 @@ env_logger = "0.11"
 rand = "0.10.1"
 bevy = "0.19.0"
 
-# External planet repos (uncomment as each factory file is filled in)
-#
-# orbitron           = { git = "https://github.com/Advanced-Programming-2025-Orbitron/Orbitron" }
-# skycartel          = { git = "https://github.com/0TH08/RustyPlanets", branch = "type-a-ai-cleanup" }
-# rustrelli          = { git = "https://github.com/Rustrelli/rustrelli" }
-# thecompilerstrikesback = { git = "https://github.com/TheCompilerStrikesBackAP2025/TheCompilerStrikesBack" }
-# crabtorio          = { git = "https://github.com/crabtorio/crabtorio" }
-# houstonwehaveaborrow = { git = "https://github.com/Houston-we-have-a-borrow/Planet" }
-# enterprise         = { git = "https://github.com/Thompspsps/Enterprise_planet" }
+# External planet repos
+orbitron = { git = "https://github.com/Advanced-Programming-2025-Orbitron/Orbitron.git" }
+skycartel = { git = "https://github.com/0TH08/Skycartel.git" }
+rustrelli = { git = "https://github.com/Rustrelli/rustrelli.git" }
+the-compiler-strikes-back = { git = "https://github.com/TheCompilerStrikesBackAP2025/TheCompilerStrikesBack.git" }
+planet = { git = "https://github.com/crabtorio/crabtorio.git" }
+Planet = { git = "https://github.com/Houston-we-have-a-borrow/Planet.git" }
+enterprise = { git = "https://github.com/Thompspsps/Enterprise_planet.git" }
 
 [dev-dependencies]

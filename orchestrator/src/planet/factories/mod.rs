@@ -12,23 +12,19 @@
 //!
 //! ## Owner: Vale (one factory file per external planet)
 
-mod orbitron;
-
 use common_game::components::planet::Planet;
 use common_game::protocols::orchestrator_planet::PlanetToOrchestrator;
 use common_game::protocols::planet_explorer::ExplorerToPlanet;
 use common_game::utils::ID;
 use crossbeam_channel::{Receiver, Sender};
 
-// one sub-module per external planet group - uncomment as you integrate them
-
-// pub mod orbitron;
-// pub mod skycartel;
-// pub mod rustrelli;
-// pub mod thecompilerstrikesback;
-// pub mod crabtorio;
-// pub mod houstonwehaveaborrow;
-// pub mod enterprise;
+pub mod crabtorio;
+pub mod enterprise;
+pub mod houstonwehaveaborrow;
+pub mod orbitron;
+pub mod rustrelli;
+pub mod skycartel;
+pub mod thecompilerstrikesback;
 
 /// Factory trait implemented once per external planet crate.
 ///
@@ -57,12 +53,12 @@ pub trait PlanetFactory: Send + Sync {
 /// TODO(Vale): uncomment and add each factory as you integrate them.
 pub fn all_factories() -> Vec<Box<dyn PlanetFactory>> {
     vec![
-        // Box::new(orbitron::OrbitronFactory),
-        // Box::new(skycartel::SkycartelFactory),
-        // Box::new(rustrelli::RustrellliFactory),
-        // Box::new(thecompilerstrikesback::TheCompilerStrikesBackFactory),
-        // Box::new(crabtorio::CrabtorioFactory),
-        // Box::new(houstonwehaveaborrow::HoustonFactory),
-        // Box::new(enterprise::EnterpriseFactory),
+        Box::new(orbitron::OrbitronFactory),
+        Box::new(skycartel::SkycartelFactory),
+        Box::new(rustrelli::RustrelliFatory),
+        Box::new(thecompilerstrikesback::TheCompilerStrikesBackFactory),
+        Box::new(crabtorio::CrabtorioFactory),
+        Box::new(houstonwehaveaborrow::HoustonFactory),
+        Box::new(enterprise::EnterpriseFactory),
     ]
 }
