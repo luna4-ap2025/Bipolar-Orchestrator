@@ -84,7 +84,7 @@ pub fn dispatch_to_planet(
                     log::info!("Planet {ack_id} deflected the asteroid with a rocket");
                 } else {
                     log::warn!("Planet {ack_id} has no rocket - it is destroyed");
-                    destroy_planet(ack_id, planets, topology, prob_registry)?;
+                    destroy_planet(ack_id, planets, topology, prob_registry, rng)?;
                 }
             }
             other => {
@@ -102,6 +102,7 @@ pub fn destroy_planet(
     planets: &mut PlanetRegistry,
     topology: &mut Topology,
     prob_registry: &mut ProbabilityRegistry,
+    rng: &mut impl rand::Rng,
 ) -> Result<(), OrchestratorError> {
     // send kill
     if let Some(handle) = planets.get(planet_id) {
@@ -114,7 +115,7 @@ pub fn destroy_planet(
     }
 
     topology.remove_planet(planet_id);
-    prob_registry.on_planet_death(planet_id);
+    prob_registry.on_planet_death(planet_id, rng);
 
     log::info!("Planet {planet_id} removed from galaxy. Bipolar mode: {:?}", prob_registry.bipolar_mode());
     Ok(())

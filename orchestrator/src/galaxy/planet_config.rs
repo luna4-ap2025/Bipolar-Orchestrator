@@ -1,50 +1,37 @@
-//! # Planet factory configuration parser
+//! # Planet factory configuration
 //!
-//! Reads `planets.toml` and returns a map of `planet_id → factory_name`.
-//! This tells the orchestrator which group's planet implementation to use
-//! for each ID listed in the galaxy topology file.
+//! Parses `planets.toml` into a map of `planet_id -> factory_name`.
+//! The orchestrator uses this to know which group's planet crate to
+//! instantiate for each planet id in the topology.
 //!
-//! ## File format
-//! A minimal TOML-like format with a single `[planets]` section:
-//!
+//! Format:
 //! ```toml
 //! [planets]
 //! 1 = "orbitron"
 //! 2 = "rustrelli"
 //! ```
-//!
-//! Lines beginning with `#` are comments and are ignored.
-//! The `[planets]` header is required.
-//!
-//! ## Owner: Vale
+//! Lines starting with `#` are ignored. The `[planets]` section header is required.
 
 use crate::error::OrchestratorError;
 use common_game::utils::ID;
 use std::collections::HashMap;
 use std::path::Path;
 
-/// Maps planet IDs to factory names as read from `planets.toml`.
+/// Maps planet ids to factory names as read from `planets.toml`.
 pub type PlanetConfigMap = HashMap<ID, String>;
 
-/// Parses the planet factory configuration file at `path`.
-///
-/// # Errors
-/// Returns [`OrchestratorError::GalaxyFileError`] if the file cannot be read,
-/// if the `[planets]` section is missing, or if any line is malformed.
+/// Parses the planet config file at `path`.
 pub fn parse(path: impl AsRef<Path>) -> Result<PlanetConfigMap, OrchestratorError> {
     let content = std::fs::read_to_string(path.as_ref()).map_err(|e| {
         OrchestratorError::GalaxyFileError(format!(
-            "Cannot read planet config {:?}: {e}",
+            "cannot read planet config {:?}: {e}",
             path.as_ref()
         ))
     })?;
     parse_str(&content)
 }
 
-/// Parses planet factory configuration from a string (useful for testing).
-///
-/// # Errors
-/// See [`parse`].
+/// Parses planet config from a string.
 pub fn parse_str(content: &str) -> Result<PlanetConfigMap, OrchestratorError> {
     let mut map = PlanetConfigMap::new();
     let mut in_planets_section = false;
@@ -61,7 +48,6 @@ pub fn parse_str(content: &str) -> Result<PlanetConfigMap, OrchestratorError> {
             continue;
         }
 
-        // any other section header ends the planets block
         if line.starts_with('[') {
             in_planets_section = false;
             continue;
@@ -71,7 +57,6 @@ pub fn parse_str(content: &str) -> Result<PlanetConfigMap, OrchestratorError> {
             continue;
         }
 
-        // parse:  <id> = "<factory_name>"
         let (id, name) = parse_assignment(line, line_no + 1)?;
         map.insert(id, name);
     }
@@ -100,9 +85,8 @@ fn parse_assignment(line: &str, line_no: usize) -> Result<(ID, String), Orchestr
 
     let id: ID = id_str
         .parse()
-        .map_err(|_| err(line_no, &format!("'{id_str}' is not a valid planet id (u32)")))?;
+        .map_err(|_| err(line_no, &format!("'{id_str}' is not a valid planet id")))?;
 
-    // strip surrounding quotes
     let name = name_str
         .strip_prefix('"')
         .and_then(|s| s.strip_suffix('"'))
@@ -126,12 +110,7 @@ mod tests {
 
     #[test]
     fn parses_basic_config() {
-        let input = r#"
-# example
-[planets]
-1 = "orbitron"
-2 = "rustrelli"
-"#;
+        let input = "[planets]\n1 = \"orbitron\"\n2 = \"rustrelli\"\n";
         let map = parse_str(input).unwrap();
         assert_eq!(map.get(&1).unwrap(), "orbitron");
         assert_eq!(map.get(&2).unwrap(), "rustrelli");
@@ -139,20 +118,17 @@ mod tests {
 
     #[test]
     fn missing_section_header_is_error() {
-        let input = r#"1 = "orbitron""#;
-        assert!(parse_str(input).is_err());
+        assert!(parse_str("1 = \"orbitron\"").is_err());
     }
 
     #[test]
     fn unquoted_name_is_error() {
-        let input = "[planets]\n1 = orbitron";
-        assert!(parse_str(input).is_err());
+        assert!(parse_str("[planets]\n1 = orbitron").is_err());
     }
 
     #[test]
     fn invalid_id_is_error() {
-        let input = "[planets]\nabc = \"orbitron\"";
-        assert!(parse_str(input).is_err());
+        assert!(parse_str("[planets]\nabc = \"orbitron\"").is_err());
     }
 
     #[test]
@@ -164,8 +140,7 @@ mod tests {
 
     #[test]
     fn empty_planets_section_is_ok() {
-        let input = "[planets]\n";
-        let map = parse_str(input).unwrap();
+        let map = parse_str("[planets]\n").unwrap();
         assert!(map.is_empty());
     }
 }

@@ -1,23 +1,17 @@
 //! # Explorer move protocol
 //!
-//! Implements the full three-step move sequence described in the project spec
-//! and in `MESSAGE_DIAGRAMS.md` ("Moving to another planet").
+//! Implements the three-step move sequence from MESSAGE_DIAGRAMS.md:
 //!
-//! ## Steps
-//! 1. `OutgoingExplorerRequest` → current planet → wait for `OutgoingExplorerResponse`.
-//! 2. `IncomingExplorerRequest` → destination planet (with the explorer's dedicated
-//!    `Sender<PlanetToExplorer>`) → wait for `IncomingExplorerResponse`.
-//! 3. `MoveToPlanet` → explorer (with the destination planet's `ExplorerToPlanet` sender)
-//!    → wait for `MovedToPlanetResult`.
+//! 1. `OutgoingExplorerRequest` to the current planet; wait for ack.
+//! 2. `IncomingExplorerRequest` (with the explorer's dedicated reply sender)
+//!    to the destination planet; wait for ack.
+//! 3. `MoveToPlanet` (with the destination planet's explorer sender)
+//!    to the explorer; wait for confirmation.
 //!
-//! ## Owner: Vale
-//!
-//! ## Vivi dependency
-//! [`crate::explorer::handle::ExplorerHandle`] must expose a
-//! `planet_reply_tx(&self) -> Sender<PlanetToExplorer>` method (or a public field)
-//! that returns the dedicated sender the planet uses to reply to this explorer.
-//! The orchestrator creates this channel at explorer spawn time and keeps the sender;
-//! the explorer keeps the receiver permanently (it never changes across planet moves).
+//! TODO(Vivi): `ExplorerHandle` must expose `planet_reply_tx()` returning
+//! `Sender<PlanetToExplorer>`. This sender is created at explorer spawn time;
+//! the orchestrator holds it and passes it to each new planet on arrival.
+//! Replace the `todo!()` in step 2 once that method exists.
 
 use crate::error::OrchestratorError;
 use crate::explorer::ExplorerRegistry;
@@ -32,19 +26,14 @@ use std::time::Duration;
 
 const MOVE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Executes the three-step explorer move protocol synchronously.
+/// Runs the three-step move protocol synchronously.
 ///
-/// Returns `Ok(())` when the orchestrator has sent `MoveToPlanet` to the explorer
-/// and received `MovedToPlanetResult` back.
+/// Returns `Ok(())` once the explorer confirms arrival at the destination.
 ///
 /// # Errors
-/// - [`OrchestratorError::NotANeighbor`] if `dst` is not adjacent to `current`.
-/// - [`OrchestratorError::PlanetNotFound`] if either planet doesn't exist.
-/// - [`OrchestratorError::ExplorerNotFound`] if the explorer doesn't exist.
-/// - [`OrchestratorError::ChannelError`] if any step times out or disconnects.
-///
-/// # Vivi dependency
-/// Requires `ExplorerHandle::planet_reply_tx()` to exist — see module-level docs.
+/// - `NotANeighbor` if the destination is not adjacent to the current planet.
+/// - `PlanetNotFound` / `ExplorerNotFound` if a registry lookup fails.
+/// - `ChannelError` if any step times out or a channel is disconnected.
 pub fn execute(
     explorer_id: ID,
     current_planet_id: ID,
@@ -55,7 +44,6 @@ pub fn execute(
     planet_ack_rx: &Receiver<PlanetToOrchestrator>,
     explorer_ack_rx: &Receiver<crate::explorer::handle::ExplorerToOrchestratorMsg>,
 ) -> Result<(), OrchestratorError> {
-    // Validate the move is topologically legal.
     {
         let topo = topology.lock().unwrap();
         if !topo.are_neighbors(current_planet_id, dst_planet_id) {
@@ -66,9 +54,7 @@ pub fn execute(
         }
     }
 
-    // ── Step 1 ────────────────────────────────────────────────────────────────
-    // Tell the CURRENT planet the explorer is leaving.
-    // The planet drops the explorer's Sender<PlanetToExplorer> from its map.
+    // Step 1: notify the current planet the explorer is leaving.
     {
         let planets = planets.lock().unwrap();
         let current = planets
@@ -80,25 +66,17 @@ pub fn execute(
     }
     wait_for_outgoing_ack(planet_ack_rx, current_planet_id)?;
 
-    // ── Step 2 ────────────────────────────────────────────────────────────────
-    // Tell the DESTINATION planet the explorer is arriving.
-    // We pass the explorer's dedicated Sender<PlanetToExplorer> so the planet
-    // can reply directly to this explorer (the explorer's rx_planet never changes).
-    //
-    // VIVI: ExplorerHandle must have `planet_reply_tx(&self) -> Sender<PlanetToExplorer>`.
-    // The Sender is created at explorer spawn time (orchestrator keeps sender,
-    // explorer keeps receiver).
-    // VIVI: replace `todo!()` with `expl.planet_reply_tx()` once ExplorerHandle
-    // has that method (see module-level doc for the exact field/method to add).
+    // Step 2: notify the destination planet the explorer is arriving.
+    // The planet needs the explorer's dedicated reply sender so it can
+    // communicate back directly.
+    // TODO(Vivi): replace todo!() with expl.planet_reply_tx() once that
+    // method is added to ExplorerHandle.
     #[allow(clippy::diverging_sub_expression)]
     let planet_reply_tx: crossbeam_channel::Sender<
         common_game::protocols::planet_explorer::PlanetToExplorer,
     > = {
         let _explorers = explorers.lock().unwrap();
-        todo!(
-            "ExplorerHandle::planet_reply_tx() not yet added by Vivi — \
-             add `planet_reply_tx: Sender<PlanetToExplorer>` field + getter to ExplorerHandle"
-        )
+        todo!("ExplorerHandle::planet_reply_tx() not yet implemented")
     };
 
     {
@@ -114,10 +92,8 @@ pub fn execute(
     }
     wait_for_incoming_ack(planet_ack_rx, dst_planet_id)?;
 
-    // ── Step 3 ────────────────────────────────────────────────────────────────
-    // Tell the EXPLORER to switch to the new planet.
-    // We give it the destination planet's ExplorerToPlanet sender so it can
-    // write to the new planet (the explorer replaces its tx_planet with this).
+    // Step 3: tell the explorer to switch to the new planet and give it the
+    // destination planet's sender so it can write to the planet directly.
     let dst_explorer_tx = {
         let planets = planets.lock().unwrap();
         let dst = planets
@@ -139,7 +115,6 @@ pub fn execute(
     }
     wait_for_move_ack(explorer_ack_rx, explorer_id)?;
 
-    // Update the orchestrator's record of the explorer's location.
     {
         let mut explorers = explorers.lock().unwrap();
         if let Some(h) = explorers.get_mut(explorer_id) {
@@ -147,11 +122,9 @@ pub fn execute(
         }
     }
 
-    log::info!("Explorer {explorer_id} moved {current_planet_id} → {dst_planet_id}");
+    log::info!("Explorer {explorer_id} moved from {current_planet_id} to {dst_planet_id}");
     Ok(())
 }
-
-// ── Private helpers ────────────────────────────────────────────────────────────
 
 fn wait_for_outgoing_ack(
     rx: &Receiver<PlanetToOrchestrator>,
@@ -187,11 +160,10 @@ fn wait_for_incoming_ack(
     }
 }
 
-/// Waits for the explorer to confirm it has switched to the new planet.
+/// Waits for the explorer to confirm it has switched planets.
 ///
-/// # Vivi dependency
-/// The explorer must send `MovedToPlanetResult` after handling `MoveToPlanet`.
-/// Currently the explorer does NOT send this — Vivi must add it.
+/// TODO(Vivi): the explorer must send `MovedToPlanetResult` after handling
+/// `MoveToPlanet`. Wire this in explorer_jebediah and explorer_viviana.
 fn wait_for_move_ack(
     rx: &Receiver<crate::explorer::handle::ExplorerToOrchestratorMsg>,
     explorer_id: ID,
@@ -220,30 +192,19 @@ mod tests {
 
     #[test]
     fn not_a_neighbor_is_rejected() {
-        // Build topology via the public parser: 1↔2, 3 is isolated
         let topo = Arc::new(Mutex::new(
             crate::galaxy::parser::parse_str("1 2\n2 1\n3\n").unwrap(),
         ));
         let planets = Arc::new(Mutex::new(PlanetRegistry::new()));
         let explorers = Arc::new(Mutex::new(ExplorerRegistry::new()));
-
         let (_planet_tx, planet_rx) = crossbeam_channel::unbounded();
         let (_expl_tx, expl_rx) = crossbeam_channel::unbounded::<crate::explorer::handle::ExplorerToOrchestratorMsg>();
 
-        let result = execute(
-            42,   // explorer_id
-            1,    // current_planet_id
-            3,    // dst_planet_id — NOT a neighbor of 1
-            &topo,
-            &planets,
-            &explorers,
-            &planet_rx,
-            &expl_rx,
-        );
+        let result = execute(42, 1, 3, &topo, &planets, &explorers, &planet_rx, &expl_rx);
 
         assert!(
             matches!(result, Err(OrchestratorError::NotANeighbor { from: 1, to: 3 })),
-            "expected NotANeighbor error, got {result:?}"
+            "expected NotANeighbor, got {result:?}"
         );
     }
 }

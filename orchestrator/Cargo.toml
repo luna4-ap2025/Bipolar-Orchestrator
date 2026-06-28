@@ -15,6 +15,10 @@ env_logger = "0.11"
 rand = "0.10.1"
 bevy = "0.19.0"
 
+# External explorer repos
+# switch to git dep after pushing: { git = "https://github.com/TheFIXmess/explorer_jebediah.git" }
+explorer_jebediah = { path = "../../explorer_jebediah" }
+
 # External planet repos
 orbitron = { git = "https://github.com/Advanced-Programming-2025-Orbitron/Orbitron.git" }
 skycartel = { git = "https://github.com/0TH08/Skycartel.git" }
