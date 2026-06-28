@@ -170,7 +170,7 @@ impl OrchestratorApi {
                     let mut planets = self.planets.lock().unwrap();
                     let mut topo = self.topology.lock().unwrap();
                     let mut prob = self.prob_registry.lock().unwrap();
-                    crate::logic::tick::destroy_planet(planet_id, &mut planets, &mut topo, &mut prob)?;
+                    crate::logic::tick::destroy_planet(planet_id, &mut planets, &mut topo, &mut prob, &mut rand::rng())?;
                 }
                 Ok(survived)
             }

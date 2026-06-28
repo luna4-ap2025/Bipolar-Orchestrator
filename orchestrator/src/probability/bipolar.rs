@@ -1,35 +1,34 @@
 //! # Bipolar mode tracker
 //!
-//! Tracks whether the galaxy is currently in **Normal** or **Flipped** mode.
-//! Every time a planet dies, the mode toggles. This is the "bipolar" mechanic:
-//! the galaxy alternates between being benign (many sunrays) and hostile (many
-//! asteroids) each time a planet is destroyed.
+//! Tracks whether the galaxy is currently under **SOLACE** or **ECLIPSE**.
+//! Every time a planet dies, the personality flips. This is the bipolar mechanic:
+//! the galaxy alternates between nurturing (SOLACE, high sunray probability) and
+//! destructive (ECLIPSE, high asteroid probability) each time a planet is destroyed.
 //!
 //! ## Owner: Vale
 
-/// The current phase of the bipolar mechanic.
+/// The active orchestrator personality.
 ///
-/// `Normal`  → curves run as assigned (early game: many sunrays).
-/// `Flipped` → every curve is inverted (`1.0 - value`), making the galaxy
-///             more hostile (many asteroids).
+/// `Solace`  → curves run as assigned. Sunray-leaning. She nurtures.
+/// `Eclipse` → every curve is inverted (`1.0 - value`). Asteroid-leaning. She destroys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BipolarMode {
-    Normal,
-    Flipped,
+    Solace,
+    Eclipse,
 }
 
 impl BipolarMode {
-    /// Returns the next mode (toggles between `Normal` and `Flipped`).
+    /// Flips to the other personality. Called on every planet death.
     pub fn next(self) -> Self {
         match self {
-            Self::Normal => Self::Flipped,
-            Self::Flipped => Self::Normal,
+            Self::Solace => Self::Eclipse,
+            Self::Eclipse => Self::Solace,
         }
     }
 
-    /// Returns `true` if the mode is currently flipped.
-    pub fn is_flipped(self) -> bool {
-        matches!(self, Self::Flipped)
+    /// Returns `true` if ECLIPSE is currently in control.
+    pub fn is_eclipse(self) -> bool {
+        matches!(self, Self::Eclipse)
     }
 }
 
@@ -39,8 +38,8 @@ mod tests {
 
     #[test]
     fn toggles_correctly() {
-        let m = BipolarMode::Normal;
-        assert_eq!(m.next(), BipolarMode::Flipped);
-        assert_eq!(m.next().next(), BipolarMode::Normal);
+        let m = BipolarMode::Solace;
+        assert_eq!(m.next(), BipolarMode::Eclipse);
+        assert_eq!(m.next().next(), BipolarMode::Solace);
     }
 }

@@ -1,20 +1,21 @@
 //! # Probability curves
 //!
 //! Each variant of [`CurveKind`] represents a distinct mathematical function
-//! and its **bipolar counterpart** (the function used after a planet dies).
+//! evaluated at `t = phase_elapsed` (seconds since the current phase began).
 //!
 //! All curves return a value in `[0.0, 1.0]` representing sunray probability.
+//! ECLIPSE inverts every curve via `1.0 - value`.
 //!
-//! ## Curve catalogue
+//! ## Curve behaviour at phase start (t = 0)
 //!
-//! | Kind         | Normal                          | Bipolar counterpart          |
-//! |--------------|---------------------------------|------------------------------|
-//! | `Sine`       | `(sin(t) + 1) / 2`             | `(cos(t) + 1) / 2`          |
-//! | `Cosine`     | `(cos(t) + 1) / 2`             | `(sin(t) + 1) / 2`          |
-//! | `Sawtooth`   | `(t % period) / period`         | `1 - (t % period) / period` |
-//! | `Triangle`   | linear rise then fall           | linear fall then rise        |
-//! | `Square`     | alternates 1.0 / 0.0           | alternates 0.0 / 1.0        |
-//! | `Exponential`| `e^(-t*k)` decaying to 0      | `1 - e^(-t*k)` rising to 1  |
+//! | Kind          | SOLACE starts at | ECLIPSE starts at | Character                        |
+//! |---------------|------------------|-------------------|----------------------------------|
+//! | `Sine`        | 0.5 (neutral)    | 0.5 (neutral)     | Smooth oscillation, no extremes  |
+//! | `Cosine`      | 1.0 (full sun)   | 0.0 (full asteroid)| Cleanest narrative arc          |
+//! | `Sawtooth`    | 1.0 (full sun)   | 0.0 (full asteroid)| Linear slide, then hard reset   |
+//! | `Triangle`    | 1.0 (full sun)   | 0.0 (full asteroid)| Symmetric rise and fall         |
+//! | `Square`      | 1.0 (full sun)   | 0.0 (full asteroid)| Hard snaps, no middle ground    |
+//! | `Exponential` | 1.0 (full sun)   | 0.0 (full asteroid)| Starts decisive, fades to chaos |
 //!
 //! ## Owner: Vale
 
@@ -25,7 +26,7 @@ const PERIOD: f64 = 10.0;
 /// Decay constant for the exponential curve.
 const DECAY_K: f64 = 0.05;
 
-/// Identifies a curve family (variant-pair of normal + bipolar counterpart).
+/// Identifies a curve family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CurveKind {
     Sine,
@@ -49,8 +50,7 @@ impl CurveKind {
         ]
     }
 
-    /// Constructs the concrete [`ProbabilityCurve`] for this kind, taking the
-    /// current [`BipolarMode`] into account.
+    /// Constructs the concrete [`ProbabilityCurve`] for this kind under the given personality.
     pub fn build(self, mode: BipolarMode) -> ProbabilityCurve {
         ProbabilityCurve { kind: self, mode }
     }
@@ -65,52 +65,66 @@ pub struct ProbabilityCurve {
 }
 
 impl ProbabilityCurve {
-    /// Evaluates the curve at time `t` (seconds since game start).
+    /// Evaluates the curve at `t` seconds into the current phase.
     ///
     /// Returns a value in `[0.0, 1.0]` representing sunray probability.
-    /// The bipolar mode flips normal ↔ counterpart behavior.
+    /// ECLIPSE inverts the result so high values become low and vice versa.
     #[must_use]
     pub fn evaluate(&self, t: f64) -> f64 {
-        let normal = self.evaluate_normal(t);
+        let solace_value = self.evaluate_solace(t);
         match self.mode {
-            BipolarMode::Normal => normal,
-            BipolarMode::Flipped => 1.0 - normal,
+            BipolarMode::Solace => solace_value,
+            BipolarMode::Eclipse => 1.0 - solace_value,
         }
     }
 
-    /// Evaluates the curve in its **normal** (non-flipped) form.
-    fn evaluate_normal(&self, t: f64) -> f64 {
+    /// Evaluates the curve as SOLACE would use it — the "base" form.
+    /// All curves start at or near 1.0 so SOLACE opens each phase nurturing.
+    fn evaluate_solace(&self, t: f64) -> f64 {
         match self.kind {
+            // Smooth oscillation between 0 and 1. Starts at 0.5 (neutral).
+            // SOLACE: gently rises then falls. Neither extreme at start.
             CurveKind::Sine => (t.sin() + 1.0) / 2.0,
 
+            // Smooth oscillation, starts at 1.0 (full sunray).
+            // SOLACE opens fully in control and gracefully loses grip.
+            // Best narrative curve — mirror-perfect for both sides.
             CurveKind::Cosine => (t.cos() + 1.0) / 2.0,
 
+            // Linear slide from 1.0 → 0.0 over one period, then hard reset.
+            // SOLACE: starts nurturing, slowly bleeds toward destruction, snaps back.
+            // Fixed from old version (was 0→1, wrong direction for SOLACE).
             CurveKind::Sawtooth => {
                 let phase = t % PERIOD;
-                phase / PERIOD
+                1.0 - phase / PERIOD
             }
 
+            // Symmetric: falls 1→0 in first half, rises 0→1 in second half.
+            // SOLACE: opens with grace, hits a destructive valley, recovers.
+            // Fixed from old version (was rising first, starting at 0).
             CurveKind::Triangle => {
-                // rises from 0→1 in first half-period, falls 1→0 in second half
                 let phase = t % PERIOD;
                 let half = PERIOD / 2.0;
                 if phase < half {
-                    phase / half
+                    1.0 - phase / half        // falls from 1.0 → 0.0
                 } else {
-                    1.0 - (phase - half) / half
+                    (phase - half) / half     // rises from 0.0 → 1.0
                 }
             }
 
+            // Hard snap: 1.0 for first half-period, 0.0 for second half.
+            // SOLACE: fully in control, then ECLIPSE violently seizes it.
+            // No gradual bleed — abrupt personality takeover mid-phase.
             CurveKind::Square => {
-                // alternates between 1.0 (sunray) and 0.0 (asteroid)
                 let phase = t % PERIOD;
                 if phase < PERIOD / 2.0 { 1.0 } else { 0.0 }
             }
 
-            CurveKind::Exponential => {
-                // starts near 1.0, decays towards 0.0 (increasingly hostile)
-                (-DECAY_K * t).exp()
-            }
+            // Starts at 1.0 and decays toward 0. Uses phase_elapsed (not
+            // global time) so it always starts fresh at 1.0 each new phase.
+            // SOLACE: opens fully nurturing but loses grip permanently as
+            // the phase ages. The longer she holds on, the more chaos grows.
+            CurveKind::Exponential => (-DECAY_K * t).exp(),
         }
     }
 }
@@ -119,19 +133,19 @@ impl ProbabilityCurve {
 mod tests {
     use super::*;
 
-    fn curve(kind: CurveKind) -> ProbabilityCurve {
-        kind.build(BipolarMode::Normal)
+    fn solace(kind: CurveKind) -> ProbabilityCurve {
+        kind.build(BipolarMode::Solace)
     }
 
-    fn flipped(kind: CurveKind) -> ProbabilityCurve {
-        kind.build(BipolarMode::Flipped)
+    fn eclipse(kind: CurveKind) -> ProbabilityCurve {
+        kind.build(BipolarMode::Eclipse)
     }
 
     #[test]
     fn all_curves_return_values_in_unit_interval() {
         for kind in CurveKind::all() {
             for t in [0.0_f64, 1.0, 5.0, 10.0, 100.0] {
-                let v = curve(kind).evaluate(t);
+                let v = solace(kind).evaluate(t);
                 assert!(
                     (0.0..=1.0).contains(&v),
                     "{kind:?} at t={t} returned {v} outside [0,1]"
@@ -141,36 +155,62 @@ mod tests {
     }
 
     #[test]
-    fn bipolar_flips_value() {
+    fn eclipse_inverts_solace() {
         for kind in CurveKind::all() {
             let t = 3.7_f64;
-            let normal = curve(kind).evaluate(t);
-            let flipped_val = flipped(kind).evaluate(t);
+            let s = solace(kind).evaluate(t);
+            let e = eclipse(kind).evaluate(t);
             assert!(
-                (normal + flipped_val - 1.0).abs() < 1e-10,
-                "{kind:?}: normal={normal} + flipped={flipped_val} should sum to 1"
+                (s + e - 1.0).abs() < 1e-10,
+                "{kind:?}: solace={s} + eclipse={e} should sum to 1"
             );
         }
     }
 
     #[test]
-    fn exponential_starts_high_and_decays() {
-        let c = curve(CurveKind::Exponential);
-        let early = c.evaluate(0.0);
-        let late = c.evaluate(1000.0);
-        assert!(early > late, "Exponential should decay over time");
-        assert!((early - 1.0).abs() < 1e-10, "Starts at 1.0");
+    fn solace_curves_start_high_or_neutral() {
+        // All SOLACE curves should start at >= 0.5 (leaning nurturing)
+        for kind in CurveKind::all() {
+            let v = solace(kind).evaluate(0.0);
+            assert!(
+                v >= 0.5,
+                "{kind:?} SOLACE starts at {v}, expected >= 0.5"
+            );
+        }
     }
 
     #[test]
-    fn sine_and_cosine_are_counterparts() {
-        // sine and cosine are independent curves, not counterparts of each other.
-        // both just need to stay in [0,1] regardless of mode.
-        for t in [0.0_f64, std::f64::consts::PI / 2.0, std::f64::consts::PI] {
-            let s = curve(CurveKind::Sine).evaluate(t);
-            let c = curve(CurveKind::Cosine).evaluate(t);
-            assert!((0.0..=1.0).contains(&s));
-            assert!((0.0..=1.0).contains(&c));
+    fn eclipse_curves_start_low_or_neutral() {
+        // All ECLIPSE curves should start at <= 0.5 (leaning destructive)
+        for kind in CurveKind::all() {
+            let v = eclipse(kind).evaluate(0.0);
+            assert!(
+                v <= 0.5,
+                "{kind:?} ECLIPSE starts at {v}, expected <= 0.5"
+            );
         }
+    }
+
+    #[test]
+    fn exponential_starts_at_one_and_decays() {
+        let c = solace(CurveKind::Exponential);
+        let start = c.evaluate(0.0);
+        let later = c.evaluate(100.0);
+        assert!((start - 1.0).abs() < 1e-10, "Starts at 1.0");
+        assert!(start > later, "Decays over time");
+    }
+
+    #[test]
+    fn sawtooth_starts_at_one_and_falls() {
+        let c = solace(CurveKind::Sawtooth);
+        assert!((c.evaluate(0.0) - 1.0).abs() < 1e-10, "Starts at 1.0");
+        assert!(c.evaluate(5.0) < c.evaluate(0.0), "Falls over time");
+    }
+
+    #[test]
+    fn triangle_starts_at_one_and_falls_first() {
+        let c = solace(CurveKind::Triangle);
+        assert!((c.evaluate(0.0) - 1.0).abs() < 1e-10, "Starts at 1.0");
+        assert!(c.evaluate(2.5) < c.evaluate(0.0), "Falls in first half");
     }
 }
