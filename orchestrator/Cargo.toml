@@ -16,8 +16,8 @@ rand = "0.10.1"
 bevy = "0.19.0"
 
 # External explorer repos
-# switch to git dep after pushing: { git = "https://github.com/TheFIXmess/explorer_jebediah.git" }
-explorer_jebediah = { path = "../../explorer_jebediah" }
+explorer_jebediah = { git = "https://github.com/TheFIXmess/explorer_jebediah.git" }
+explorer_astronaut = { git = "https://github.com/vivis2kuni/explorer_viviana.git" }
 
 # External planet repos
 orbitron = { git = "https://github.com/Advanced-Programming-2025-Orbitron/Orbitron.git" }
