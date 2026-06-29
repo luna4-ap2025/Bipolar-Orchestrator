@@ -24,7 +24,8 @@ use crate::explorer::ExplorerRegistry;
 use crate::galaxy::Topology;
 use crate::planet::PlanetRegistry;
 use crate::probability::ProbabilityRegistry;
-use common_game::protocols::orchestrator_explorer::OrchestratorToExplorer;
+use common_game::components::forge::Forge;
+use crate::explorer::handle::ExplorerToOrchestratorMsg;
 use common_game::protocols::orchestrator_planet::PlanetToOrchestrator;
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use std::sync::{Arc, Mutex};
@@ -77,6 +78,7 @@ impl LogicController {
         explorers: Arc<Mutex<ExplorerRegistry>>,
         prob_registry: Arc<Mutex<ProbabilityRegistry>>,
         planet_rx: Arc<Mutex<Receiver<PlanetToOrchestrator>>>,
+        explorer_rx: Arc<Mutex<Receiver<ExplorerToOrchestratorMsg>>>,
     ) -> Result<(), OrchestratorError> {
         if self.is_running() {
             return Err(OrchestratorError::InvalidState(
@@ -95,6 +97,7 @@ impl LogicController {
                     explorers,
                     prob_registry,
                     planet_rx,
+                    explorer_rx,
                     control_rx,
                 );
             })
@@ -144,10 +147,17 @@ fn run_logic_loop(
     explorers: Arc<Mutex<ExplorerRegistry>>,
     prob_registry: Arc<Mutex<ProbabilityRegistry>>,
     planet_rx: Arc<Mutex<Receiver<PlanetToOrchestrator>>>,
+    explorer_rx: Arc<Mutex<Receiver<ExplorerToOrchestratorMsg>>>,
     control_rx: Receiver<ControlSignal>,
 ) {
-    use rand::Rng;
     let mut rng = rand::rng();
+    let forge = match Forge::new() {
+        Ok(forge) => forge,
+        Err(e) => {
+            log::error!("Failed to create Forge: {e}");
+            return;
+        }
+    };
 
     loop {
         // check if we got a stop signal before doing anything this tick
@@ -179,14 +189,37 @@ fn run_logic_loop(
 
         // for each alive planet, roll the dice and send sunray or asteroid
         for planet_id in planet_ids {
-            // TODO(Vivi): call tick::dispatch_to_planet(...)
-            // it rolls sunray vs asteroid using prob_registry, sends the message,
-            // waits for the ack, and handles planet destruction if needed
+            let mut prob = prob_registry.lock().unwrap();
+            let mut planets_guard = planets.lock().unwrap();
+            let mut topology_guard = topology.lock().unwrap();
+            let planet_rx_guard = planet_rx.lock().unwrap();
+
+            if let Err(e) = tick::dispatch_to_planet(
+                planet_id,
+                &forge,
+                &mut prob,
+                &mut planets_guard,
+                &mut topology_guard,
+                &planet_rx_guard,
+                &mut rng,
+            ) {
+                log::error!("Tick dispatch failed for planet {planet_id}: {e}");
+            }
         }
 
         // drain any messages from explorers that arrived autonomously this tick
-        // TODO(Vivi): call event_handler::drain_explorer_messages(...)
+        {
+            let explorer_rx_guard = explorer_rx.lock().unwrap();
+            let planet_rx_guard = planet_rx.lock().unwrap();
 
+            event_handler::drain_explorer_messages(
+                &explorer_rx_guard,
+                &planet_rx_guard,
+                &topology,
+                &planets,
+                &explorers,
+            );
+        }
         std::thread::sleep(TICK_INTERVAL);
     }
 }

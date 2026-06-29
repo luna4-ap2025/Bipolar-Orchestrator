@@ -19,7 +19,10 @@ use crate::planet::PlanetRegistry;
 use crate::probability::ProbabilityRegistry;
 use common_game::components::forge::Forge;
 use common_game::components::planet::DummyPlanetState;
-use common_game::protocols::orchestrator_explorer::OrchestratorToExplorer;
+use common_game::protocols::orchestrator_explorer::{
+    ExplorerToOrchestrator,
+    OrchestratorToExplorer,
+};
 use common_game::protocols::orchestrator_planet::{OrchestratorToPlanet, PlanetToOrchestrator};
 use common_game::protocols::planet_explorer::ExplorerToPlanet;
 use common_game::utils::ID;
@@ -45,7 +48,7 @@ pub struct OrchestratorApi {
     /// Shared receiver for all PlanetToOrchestrator messages.
     pub(crate) planet_rx: Arc<Mutex<Receiver<PlanetToOrchestrator>>>,
     /// Shared receiver for all ExplorerToOrchestrator messages.
-    pub(crate) explorer_rx: Arc<Mutex<Receiver<crate::logic::event_handler::BagContent>>>,
+    pub(crate) explorer_rx: Arc<Mutex<Receiver<crate::explorer::handle::ExplorerToOrchestratorMsg>>>,
     /// The forge used to generate sunrays and asteroids.
     pub(crate) forge: Forge,
     /// Controls the autonomous game logic thread.
@@ -80,7 +83,61 @@ impl OrchestratorApi {
             }
         }
 
-        // TODO(Vivi): drain StartPlanetAIResult / StartExplorerAIResult acks
+        // Wait for all StartPlanetAIResult acks
+        let mut pending_planets: std::collections::HashSet<ID> = {
+            let planets = self.planets.lock().unwrap();
+            planets.iter().map(|h| h.id()).collect()
+        };
+
+        while !pending_planets.is_empty() {
+            let rx = self.planet_rx.lock().unwrap();
+
+            match rx.recv_timeout(API_TIMEOUT) {
+                Ok(PlanetToOrchestrator::StartPlanetAIResult { planet_id }) => {
+                    pending_planets.remove(&planet_id);
+                }
+
+                Ok(other) => {
+                    return Err(OrchestratorError::ChannelError(format!(
+                        "Expected StartPlanetAIResult, got {other:?}"
+                    )));
+                }
+
+                Err(_) => {
+                    return Err(OrchestratorError::ChannelError(
+                        "Timeout waiting for StartPlanetAIResult".to_string(),
+                    ));
+                }
+            }
+        }
+
+        // Wait for all StartExplorerAIResult acks
+        let mut pending_explorers: std::collections::HashSet<ID> = {
+            let explorers = self.explorers.lock().unwrap();
+            explorers.iter().map(|h| h.id()).collect()
+        };
+
+        while !pending_explorers.is_empty() {
+            let rx = self.explorer_rx.lock().unwrap();
+
+            match rx.recv_timeout(API_TIMEOUT) {
+                Ok(ExplorerToOrchestrator::StartExplorerAIResult { explorer_id }) => {
+                    pending_explorers.remove(&explorer_id);
+                }
+
+                Ok(other) => {
+                    return Err(OrchestratorError::ChannelError(format!(
+                        "Expected StartExplorerAIResult, got {other:?}"
+                    )));
+                }
+
+                Err(_) => {
+                    return Err(OrchestratorError::ChannelError(
+                        "Timeout waiting for StartExplorerAIResult".to_string(),
+                    ));
+                }
+            }
+        }
 
         self.logic.start(
             Arc::clone(&self.topology),
@@ -88,6 +145,7 @@ impl OrchestratorApi {
             Arc::clone(&self.explorers),
             Arc::clone(&self.prob_registry),
             Arc::clone(&self.planet_rx),
+            Arc::clone(&self.explorer_rx),
         )
     }
 
@@ -231,8 +289,24 @@ impl OrchestratorApi {
             .map_err(OrchestratorError::ChannelError)?;
         }
 
-        // TODO(Vivi): wait for GenerateResourceResponse from explorer_rx and return its Result
-        todo!("wait for GenerateResourceResponse")
+        let rx = self.explorer_rx.lock().unwrap();
+
+        match rx.recv_timeout(API_TIMEOUT) {
+            Ok(ExplorerToOrchestrator::GenerateResourceResponse {
+                   explorer_id: ack_id,
+                   generated,
+               }) if ack_id == explorer_id => {
+                generated.map_err(OrchestratorError::ChannelError)
+            }
+
+            Ok(other) => Err(OrchestratorError::ChannelError(format!(
+                "Expected GenerateResourceResponse from explorer {explorer_id}, got {other:?}"
+            ))),
+
+            Err(_) => Err(OrchestratorError::ChannelError(format!(
+                "Timeout waiting for GenerateResourceResponse from explorer {explorer_id}"
+            ))),
+        }
     }
 
     /// Asks `explorer_id` to combine two resources on its current planet.
@@ -255,8 +329,24 @@ impl OrchestratorApi {
             .map_err(OrchestratorError::ChannelError)?;
         }
 
-        // TODO(Vivi): wait for CombineResourceResponse
-        todo!("wait for CombineResourceResponse")
+        let rx = self.explorer_rx.lock().unwrap();
+
+        match rx.recv_timeout(API_TIMEOUT) {
+            Ok(ExplorerToOrchestrator::CombineResourceResponse {
+                   explorer_id: ack_id,
+                   generated,
+               }) if ack_id == explorer_id => {
+                generated.map_err(OrchestratorError::ChannelError)
+            }
+
+            Ok(other) => Err(OrchestratorError::ChannelError(format!(
+                "Expected CombineResourceResponse from explorer {explorer_id}, got {other:?}"
+            ))),
+
+            Err(_) => Err(OrchestratorError::ChannelError(format!(
+                "Timeout waiting for CombineResourceResponse from explorer {explorer_id}"
+            ))),
+        }
     }
 
     /// Returns the internal state of `planet_id` (energy cells, rocket status).

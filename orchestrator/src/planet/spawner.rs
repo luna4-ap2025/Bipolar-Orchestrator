@@ -10,7 +10,7 @@ use super::PlanetHandle;
 use crate::error::OrchestratorError;
 use common_game::protocols::orchestrator_planet::PlanetToOrchestrator;
 use common_game::utils::ID;
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Sender, unbounded};
 
 /// All the channel ends the orchestrator keeps after spawning a planet.
 pub struct SpawnedPlanetChannels {

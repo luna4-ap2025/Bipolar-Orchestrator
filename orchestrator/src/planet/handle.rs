@@ -6,7 +6,7 @@
 //!
 //! ## Owner: Vivi
 
-use common_game::protocols::orchestrator_planet::{OrchestratorToPlanet, PlanetToOrchestrator};
+use common_game::protocols::orchestrator_planet::OrchestratorToPlanet;
 use common_game::protocols::planet_explorer::ExplorerToPlanet;
 use common_game::utils::ID;
 use crossbeam_channel::Sender;

@@ -6,28 +6,43 @@
 //!
 //! ## Owner: Vivi
 
-use common_game::protocols::orchestrator_explorer::{ExplorerToOrchestrator, OrchestratorToExplorer};
-
-/// Type alias for the concrete `ExplorerToOrchestrator` message used by the orchestrator.
-/// The bag content is `Vec<String>` (resource names as strings).
-pub type ExplorerToOrchestratorMsg = ExplorerToOrchestrator<Vec<String>>;
+use common_game::components::resource::ResourceType;
+use common_game::protocols::orchestrator_explorer::{
+    ExplorerToOrchestrator,
+    OrchestratorToExplorer,
+};
+use common_game::protocols::planet_explorer::PlanetToExplorer;
 use common_game::utils::ID;
 use crossbeam_channel::Sender;
 
-/// The bag content type the orchestrator uses. Since the orchestrator does not
-/// inspect bag contents beyond forwarding them to the visualizer, we store them
-/// as a `Vec<String>` (resource names). Adjust if your explorer sends a richer type.
-pub type BagContent = Vec<String>;
+/// The bag content type used by the orchestrator.
+///
+/// It must match the explorer's `BagContentResponse` type.
+/// The explorer sends a summary of resource types and quantities:
+/// `Vec<(ResourceType, usize)>`.
+pub type BagContent = Vec<(ResourceType, usize)>;
+
+/// Type alias for the concrete `ExplorerToOrchestrator` message used by the orchestrator.
+pub type ExplorerToOrchestratorMsg = ExplorerToOrchestrator<BagContent>;
 
 /// The orchestrator's bookkeeping for one live explorer.
 pub struct ExplorerHandle {
     /// Unique identifier of this explorer.
     id: ID,
+
     /// Sender used to deliver messages to the explorer thread.
     sender: Sender<OrchestratorToExplorer>,
+
+    /// Sender used by planets to reply directly to this explorer.
+    ///
+    /// This sender is created once when the explorer is spawned.
+    /// The explorer keeps the matching `Receiver<PlanetToExplorer>` permanently.
+    planet_reply_tx: Sender<PlanetToExplorer>,
+
     /// The ID of the planet the explorer is currently on.
     /// Updated by the router after every successful move.
     current_planet: ID,
+
     /// Join handle for the explorer thread.
     thread_handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -37,12 +52,14 @@ impl ExplorerHandle {
     pub fn new(
         id: ID,
         sender: Sender<OrchestratorToExplorer>,
+        planet_reply_tx: Sender<PlanetToExplorer>,
         starting_planet: ID,
         thread_handle: std::thread::JoinHandle<()>,
     ) -> Self {
         Self {
             id,
             sender,
+            planet_reply_tx,
             current_planet: starting_planet,
             thread_handle: Some(thread_handle),
         }
@@ -61,6 +78,11 @@ impl ExplorerHandle {
     /// Updates the current planet ID after a successful move.
     pub fn set_current_planet(&mut self, planet_id: ID) {
         self.current_planet = planet_id;
+    }
+
+    /// Returns the sender that planets use to reply to this explorer.
+    pub fn planet_reply_tx(&self) -> Sender<PlanetToExplorer> {
+        self.planet_reply_tx.clone()
     }
 
     /// Sends a message to the explorer thread.
