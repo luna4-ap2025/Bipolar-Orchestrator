@@ -2,13 +2,6 @@
 //!
 //! Wraps the `orbitron` crate's planet constructor in the [`PlanetFactory`] trait.
 //!
-//! ## Steps to activate
-//! 1. Uncomment the `orbitron` dependency in `Cargo.toml`.
-//! 2. Check the actual public API of the orbitron crate (function name,
-//!    parameter order, which `PlanetType` it uses).
-//! 3. Fill in the `create` body below.
-//! 4. Uncomment `pub mod orbitron` and the factory entry in `all_factories()`.
-//!
 //! ## Owner: Vale
 
 use super::PlanetFactory;
@@ -41,5 +34,3 @@ impl PlanetFactory for OrbitronFactory {
         ))
     }
 }
-
-// Copy this file to skycartel.rs, rustrelli.rs, etc. and adjust accordingly.

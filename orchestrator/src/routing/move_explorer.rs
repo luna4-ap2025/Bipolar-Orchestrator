@@ -11,13 +11,6 @@
 //!    → wait for `MovedToPlanetResult`.
 //!
 //! ## Owner: Vale
-//!
-//! ## Vivi dependency
-//! [`crate::explorer::handle::ExplorerHandle`] must expose a
-//! `planet_reply_tx(&self) -> Sender<PlanetToExplorer>` method (or a public field)
-//! that returns the dedicated sender the planet uses to reply to this explorer.
-//! The orchestrator creates this channel at explorer spawn time and keeps the sender;
-//! the explorer keeps the receiver permanently (it never changes across planet moves).
 
 use crate::error::OrchestratorError;
 use crate::explorer::ExplorerRegistry;
@@ -42,9 +35,6 @@ const MOVE_TIMEOUT: Duration = Duration::from_secs(5);
 /// - [`OrchestratorError::PlanetNotFound`] if either planet doesn't exist.
 /// - [`OrchestratorError::ExplorerNotFound`] if the explorer doesn't exist.
 /// - [`OrchestratorError::ChannelError`] if any step times out or disconnects.
-///
-/// # Vivi dependency
-/// Requires `ExplorerHandle::planet_reply_tx()` to exist — see module-level docs.
 pub fn execute(
     explorer_id: ID,
     current_planet_id: ID,
@@ -85,12 +75,6 @@ pub fn execute(
     // We pass the explorer's dedicated Sender<PlanetToExplorer> so the planet
     // can reply directly to this explorer (the explorer's rx_planet never changes).
     //
-    // VIVI: ExplorerHandle must have `planet_reply_tx(&self) -> Sender<PlanetToExplorer>`.
-    // The Sender is created at explorer spawn time (orchestrator keeps sender,
-    // explorer keeps receiver).
-    // VIVI: replace `todo!()` with `expl.planet_reply_tx()` once ExplorerHandle
-    // has that method (see module-level doc for the exact field/method to add).
-    #[allow(clippy::diverging_sub_expression)]
     let planet_reply_tx = {
         let explorers = explorers.lock().unwrap();
 
@@ -188,10 +172,6 @@ fn wait_for_incoming_ack(
 }
 
 /// Waits for the explorer to confirm it has switched to the new planet.
-///
-/// # Vivi dependency
-/// The explorer must send `MovedToPlanetResult` after handling `MoveToPlanet`.
-/// Currently the explorer does NOT send this — Vivi must add it.
 fn wait_for_move_ack(
     rx: &Receiver<crate::explorer::handle::ExplorerToOrchestratorMsg>,
     explorer_id: ID,

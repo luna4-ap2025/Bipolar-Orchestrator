@@ -49,8 +49,6 @@ pub trait PlanetFactory: Send + Sync {
 }
 
 /// Returns one factory instance per external planet.
-///
-/// TODO(Vale): uncomment and add each factory as you integrate them.
 pub fn all_factories() -> Vec<Box<dyn PlanetFactory>> {
     vec![
         Box::new(orbitron::OrbitronFactory),

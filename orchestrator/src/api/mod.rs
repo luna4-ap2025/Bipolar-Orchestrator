@@ -223,7 +223,6 @@ impl OrchestratorApi {
             PlanetToOrchestrator::AsteroidAck { rocket, .. } => {
                 let survived = rocket.is_some();
                 if !survived {
-                    // TODO(Vivi): call destroy_planet or delegate to tick::destroy_planet
                     log::warn!("Planet {planet_id} destroyed by manual asteroid");
                     let mut planets = self.planets.lock().unwrap();
                     let mut topo = self.topology.lock().unwrap();
@@ -245,6 +244,7 @@ impl OrchestratorApi {
     /// # Errors
     /// See [`crate::routing::move_explorer`].
     pub fn move_explorer(&self, explorer_id: ID, dst_planet_id: ID) -> Result<(), OrchestratorError> {
+        // find where the explorer currently is
         let current_planet_id = {
             let explorers = self.explorers.lock().unwrap();
             explorers
@@ -253,18 +253,20 @@ impl OrchestratorApi {
                 .current_planet()
         };
 
-        // TODO(Vale): call routing::move_explorer::execute(...)
-        // routing::move_explorer(
-        //     explorer_id,
-        //     current_planet_id,
-        //     dst_planet_id,
-        //     &self.topology,
-        //     &self.planets,
-        //     &self.explorers,
-        //     &self.planet_rx.lock().unwrap(),
-        //     &self.explorer_rx.lock().unwrap(),
-        // )
-        todo!("wire move_explorer::execute")
+        // lock both receivers before calling execute, which needs raw references
+        let planet_rx = self.planet_rx.lock().unwrap();
+        let explorer_rx = self.explorer_rx.lock().unwrap();
+
+        crate::routing::move_explorer::execute(
+            explorer_id,
+            current_planet_id,
+            dst_planet_id,
+            &self.topology,
+            &self.planets,
+            &self.explorers,
+            &planet_rx,
+            &explorer_rx,
+        )
     }
 
     /// Asks `explorer_id` to generate a basic resource on its current planet.

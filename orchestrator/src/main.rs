@@ -11,6 +11,7 @@
 //! - `--planets <path>` : path to the planet factory config (required)
 //! - `--auto`           : immediately start the game logic without waiting for user input
 
+use bipolar_orchestrator::api::OrchestratorApi;
 use bipolar_orchestrator::galaxy;
 use std::path::PathBuf;
 
@@ -59,7 +60,8 @@ fn main() {
 
     // TODO(Vivi): construct OrchestratorApi::new(topology, planet_config, ...)
     //             spawn planet threads, spawn explorer threads
-    // TODO(both): if args.auto_start, call api.start_logic() here
+    // TODO(Vivi): assign `api` here, then pass it to interactive_loop
+    // if args.auto_start { api.start_logic().unwrap(); }
 
     interactive_loop();
 }
@@ -106,16 +108,24 @@ fn parse_args() -> Args {
 
 /// Blocking interactive loop that reads user commands from stdin.
 ///
-/// Available commands (to be extended):
-/// - `start`              → start game logic
-/// - `stop`               → stop game logic
-/// - `sunray <planet_id>` → manually send a sunray to a planet
-/// - `asteroid <planet_id>` → manually send an asteroid to a planet
-/// - `move <explorer_id> <planet_id>` → move an explorer to a planet
-/// - `bag <explorer_id>`  → print explorer bag contents
-/// - `state <planet_id>`  → print planet internal state
-/// - `quit`               → gracefully shut down
-fn interactive_loop() {
+/// Accepts an `OrchestratorApi` and dispatches every typed command to it.
+/// Blocks until the user types `quit` or stdin closes.
+///
+/// Available commands:
+/// - `start`                        start the game logic loop
+/// - `stop`                         stop the game logic loop
+/// - `sunray <planet_id>`           send a sunray manually
+/// - `asteroid <planet_id>`         send an asteroid manually
+/// - `move <explorer_id> <pid>`     move an explorer to a planet
+/// - `generate <explorer_id> <res>` generate a basic resource
+/// - `combine <explorer_id> <res>`  combine resources into a complex one
+/// - `bag <explorer_id>`            print the explorer bag contents
+/// - `state <planet_id>`            print planet internal state
+/// - `neighbors <planet_id>`        list neighboring planets
+/// - `planets`                      list all alive planets
+/// - `quit`                         gracefully shut down
+fn interactive_loop(api: &mut bipolar_orchestrator::api::OrchestratorApi) {
+    use bipolar_orchestrator::api::commands::{self, Command};
     use std::io::{self, BufRead};
 
     println!("Bipolar Orchestrator ready. Type 'help' for commands.");
@@ -125,15 +135,94 @@ fn interactive_loop() {
         let Ok(line) = line else { break };
         let line = line.trim().to_string();
 
-        match line.as_str() {
-            "help" => print_help(),
-            "quit" | "exit" => {
+        if line.is_empty() {
+            continue;
+        }
+
+        // parse the raw string into a typed Command
+        let cmd = match commands::parse(&line) {
+            Ok(c) => c,
+            Err(e) => {
+                println!("Error: {e}");
+                continue;
+            }
+        };
+
+        match cmd {
+            Command::Help => print_help(),
+
+            Command::Quit => {
                 println!("Shutting down...");
-                // TODO(Vivi): call api.shutdown() here before breaking
+                api.shutdown();
                 break;
             }
-            // TODO(both): parse the line with api::commands::parse() and call the right api method
-            other => println!("Unknown command: '{other}'. Type 'help'."),
+
+            Command::Start => match api.start_logic() {
+                Ok(()) => println!("Game logic started."),
+                Err(e) => println!("Error: {e}"),
+            },
+
+            Command::Stop => match api.stop_logic() {
+                Ok(()) => println!("Game logic stopped."),
+                Err(e) => println!("Error: {e}"),
+            },
+
+            Command::Sunray { planet_id } => match api.send_sunray(planet_id) {
+                Ok(()) => println!("Sunray sent to planet {planet_id}."),
+                Err(e) => println!("Error: {e}"),
+            },
+
+            Command::Asteroid { planet_id } => match api.send_asteroid(planet_id) {
+                Ok(true) => println!("Planet {planet_id} deflected the asteroid."),
+                Ok(false) => println!("Planet {planet_id} was destroyed."),
+                Err(e) => println!("Error: {e}"),
+            },
+
+            Command::MoveExplorer { explorer_id, planet_id } => {
+                match api.move_explorer(explorer_id, planet_id) {
+                    Ok(()) => println!("Explorer {explorer_id} moved to planet {planet_id}."),
+                    Err(e) => println!("Error: {e}"),
+                }
+            }
+
+            Command::GenerateResource { explorer_id, resource } => {
+                match api.generate_resource(explorer_id, resource) {
+                    Ok(()) => println!("Resource generated by explorer {explorer_id}."),
+                    Err(e) => println!("Error: {e}"),
+                }
+            }
+
+            Command::CombineResource { explorer_id, resource } => {
+                match api.combine_resource(explorer_id, resource) {
+                    Ok(()) => println!("Resource combined by explorer {explorer_id}."),
+                    Err(e) => println!("Error: {e}"),
+                }
+            }
+
+            Command::Bag { explorer_id } => {
+                // bag content display is handled once BagContentRequest is wired
+                println!("Bag command for explorer {explorer_id} not yet wired (Vivi).");
+            }
+
+            Command::PlanetState { planet_id } => match api.planet_state(planet_id) {
+                Ok(state) => println!(
+                    "Planet {planet_id}: {} cells, {} charged, rocket={}",
+                    state.energy_cells.len(),
+                    state.charged_cells_count,
+                    state.has_rocket
+                ),
+                Err(e) => println!("Error: {e}"),
+            },
+
+            Command::Neighbors { planet_id } => match api.neighbors(planet_id) {
+                Ok(ids) => println!("Neighbors of {planet_id}: {ids:?}"),
+                Err(e) => println!("Error: {e}"),
+            },
+
+            Command::AlivePlanets => {
+                let ids = api.alive_planets();
+                println!("Alive planets: {ids:?}");
+            }
         }
     }
 }
