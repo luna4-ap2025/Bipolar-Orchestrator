@@ -79,6 +79,7 @@ impl LogicController {
         prob_registry: Arc<Mutex<ProbabilityRegistry>>,
         planet_rx: Arc<Mutex<Receiver<PlanetToOrchestrator>>>,
         explorer_rx: Arc<Mutex<Receiver<ExplorerToOrchestratorMsg>>>,
+        forge: Arc<Mutex<Forge>>,
     ) -> Result<(), OrchestratorError> {
         if self.is_running() {
             return Err(OrchestratorError::InvalidState(
@@ -98,6 +99,7 @@ impl LogicController {
                     prob_registry,
                     planet_rx,
                     explorer_rx,
+                    forge,
                     control_rx,
                 );
             })
@@ -148,16 +150,10 @@ fn run_logic_loop(
     prob_registry: Arc<Mutex<ProbabilityRegistry>>,
     planet_rx: Arc<Mutex<Receiver<PlanetToOrchestrator>>>,
     explorer_rx: Arc<Mutex<Receiver<ExplorerToOrchestratorMsg>>>,
+    forge: Arc<Mutex<Forge>>,
     control_rx: Receiver<ControlSignal>,
 ) {
     let mut rng = rand::rng();
-    let forge = match Forge::new() {
-        Ok(forge) => forge,
-        Err(e) => {
-            log::error!("Failed to create Forge: {e}");
-            return;
-        }
-    };
 
     loop {
         // check if we got a stop signal before doing anything this tick
@@ -194,9 +190,11 @@ fn run_logic_loop(
             let mut topology_guard = topology.lock().unwrap();
             let planet_rx_guard = planet_rx.lock().unwrap();
 
+            let forge_guard = forge.lock().unwrap();
+
             if let Err(e) = tick::dispatch_to_planet(
                 planet_id,
-                &forge,
+                &forge_guard,
                 &mut prob,
                 &mut planets_guard,
                 &mut topology_guard,

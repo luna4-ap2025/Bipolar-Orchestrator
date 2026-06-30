@@ -24,9 +24,8 @@ use common_game::protocols::orchestrator_explorer::{
     OrchestratorToExplorer,
 };
 use common_game::protocols::orchestrator_planet::{OrchestratorToPlanet, PlanetToOrchestrator};
-use common_game::protocols::planet_explorer::ExplorerToPlanet;
 use common_game::utils::ID;
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -50,12 +49,34 @@ pub struct OrchestratorApi {
     /// Shared receiver for all ExplorerToOrchestrator messages.
     pub(crate) explorer_rx: Arc<Mutex<Receiver<crate::explorer::handle::ExplorerToOrchestratorMsg>>>,
     /// The forge used to generate sunrays and asteroids.
-    pub(crate) forge: Forge,
+    pub(crate) forge: Arc<Mutex<Forge>>,
     /// Controls the autonomous game logic thread.
     pub(crate) logic: LogicController,
 }
 
 impl OrchestratorApi {
+    /// Creates a new orchestrator API from already-spawned game components.
+    pub fn new(
+        topology: Topology,
+        planets: PlanetRegistry,
+        explorers: ExplorerRegistry,
+        prob_registry: ProbabilityRegistry,
+        planet_rx: Receiver<PlanetToOrchestrator>,
+        explorer_rx: Receiver<crate::explorer::handle::ExplorerToOrchestratorMsg>,
+        forge: Forge,
+    ) -> Self {
+        Self {
+            topology: Arc::new(Mutex::new(topology)),
+            planets: Arc::new(Mutex::new(planets)),
+            explorers: Arc::new(Mutex::new(explorers)),
+            prob_registry: Arc::new(Mutex::new(prob_registry)),
+            planet_rx: Arc::new(Mutex::new(planet_rx)),
+            explorer_rx: Arc::new(Mutex::new(explorer_rx)),
+            forge: Arc::new(Mutex::new(forge)),
+            logic: LogicController::new(),
+        }
+    }
+
     /// Starts the autonomous game logic loop.
     ///
     /// Once started:
@@ -146,6 +167,7 @@ impl OrchestratorApi {
             Arc::clone(&self.prob_registry),
             Arc::clone(&self.planet_rx),
             Arc::clone(&self.explorer_rx),
+            Arc::clone(&self.forge),
         )
     }
 
@@ -169,7 +191,10 @@ impl OrchestratorApi {
     /// # Errors
     /// [`OrchestratorError::PlanetNotFound`] or [`OrchestratorError::ChannelError`].
     pub fn send_sunray(&self, planet_id: ID) -> Result<(), OrchestratorError> {
-        let sunray = self.forge.generate_sunray();
+        let sunray = {
+            let forge = self.forge.lock().unwrap();
+            forge.generate_sunray()
+        };
         {
             let planets = self.planets.lock().unwrap();
             let planet = planets
@@ -202,7 +227,10 @@ impl OrchestratorApi {
     /// # Errors
     /// [`OrchestratorError::PlanetNotFound`] or [`OrchestratorError::ChannelError`].
     pub fn send_asteroid(&mut self, planet_id: ID) -> Result<bool, OrchestratorError> {
-        let asteroid = self.forge.generate_asteroid();
+        let asteroid = {
+            let forge = self.forge.lock().unwrap();
+            forge.generate_asteroid()
+        };
         {
             let planets = self.planets.lock().unwrap();
             let planet = planets
@@ -433,5 +461,41 @@ impl OrchestratorApi {
         }
 
         log::info!("Orchestrator shutdown complete");
+    }
+
+    /// Returns the content of the explorer bag.
+    ///
+    /// # Errors
+    /// [`OrchestratorError::ExplorerNotFound`] or channel error.
+    pub fn bag_content(
+        &self,
+        explorer_id: ID,
+    ) -> Result<crate::explorer::handle::BagContent, OrchestratorError> {
+        {
+            let explorers = self.explorers.lock().unwrap();
+            let h = explorers
+                .get(explorer_id)
+                .ok_or(OrchestratorError::ExplorerNotFound(explorer_id))?;
+
+            h.send(OrchestratorToExplorer::BagContentRequest)
+                .map_err(OrchestratorError::ChannelError)?;
+        }
+
+        let rx = self.explorer_rx.lock().unwrap();
+
+        match rx.recv_timeout(API_TIMEOUT) {
+            Ok(ExplorerToOrchestrator::BagContentResponse {
+                   explorer_id: ack_id,
+                   bag_content,
+               }) if ack_id == explorer_id => Ok(bag_content),
+
+            Ok(other) => Err(OrchestratorError::ChannelError(format!(
+                "Expected BagContentResponse from explorer {explorer_id}, got {other:?}"
+            ))),
+
+            Err(_) => Err(OrchestratorError::ChannelError(format!(
+                "Timeout waiting for BagContentResponse from explorer {explorer_id}"
+            ))),
+        }
     }
 }

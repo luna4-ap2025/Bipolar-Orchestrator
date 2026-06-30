@@ -12,7 +12,18 @@
 //! - `--auto`           : immediately start the game logic without waiting for user input
 
 use bipolar_orchestrator::api::OrchestratorApi;
+use bipolar_orchestrator::explorer::{ExplorerHandle, ExplorerRegistry};
 use bipolar_orchestrator::galaxy;
+use bipolar_orchestrator::planet::{self, PlanetRegistry};
+use bipolar_orchestrator::probability::ProbabilityRegistry;
+
+use common_game::components::forge::Forge;
+use common_game::protocols::orchestrator_explorer::OrchestratorToExplorer;
+use common_game::protocols::orchestrator_planet::PlanetToOrchestrator;
+use common_game::protocols::planet_explorer::PlanetToExplorer;
+
+use crossbeam_channel::unbounded;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 fn main() {
@@ -58,12 +69,123 @@ fn main() {
         }
     }
 
-    // TODO(Vivi): construct OrchestratorApi::new(topology, planet_config, ...)
-    //             spawn planet threads, spawn explorer threads
-    // TODO(Vivi): assign `api` here, then pass it to interactive_loop
-    // if args.auto_start { api.start_logic().unwrap(); }
+    // ── Spawn planets ───────────────────────────────────────────────────────────
+    let (planet_tx, planet_rx) = unbounded::<PlanetToOrchestrator>();
 
-    interactive_loop();
+    let factories: HashMap<String, Box<dyn planet::factories::PlanetFactory>> =
+        planet::factories::all_factories()
+            .into_iter()
+            .map(|factory| (factory.name().to_lowercase(), factory))
+            .collect();
+
+    let mut planet_registry = PlanetRegistry::new();
+
+    let planet_ids: Vec<_> = topology.planet_ids().collect();
+
+    for &planet_id in &planet_ids {
+        let factory_name = planet_config
+            .get(&planet_id)
+            .ok_or_else(|| format!("Planet {planet_id} has no factory config"))
+            .unwrap();
+
+        let factory = factories
+            .get(&factory_name.to_lowercase())
+            .ok_or_else(|| format!("Unknown planet factory '{factory_name}'"))
+            .unwrap();
+
+        let handle = planet::spawn_planet(
+            planet_id,
+            factory.name(),
+            factory.as_ref(),
+            planet_tx.clone(),
+        )
+            .unwrap();
+
+        planet_registry.insert(handle);
+    }
+
+    log::info!("Spawned {} planets", planet_registry.count());
+
+    // ── Spawn explorers ─────────────────────────────────────────────────────────
+    let (explorer_tx, explorer_rx) =
+        unbounded::<bipolar_orchestrator::explorer::handle::ExplorerToOrchestratorMsg>();
+
+    let mut explorer_registry = ExplorerRegistry::new();
+
+    let starting_planet = *planet_ids
+        .first()
+        .expect("galaxy must contain at least one planet");
+
+    let starting_planet_sender = {
+        let planet = planet_registry
+            .get(starting_planet)
+            .expect("starting planet must have been spawned");
+
+        planet.explorer_sender()
+    };
+
+    // Orchestrator -> Explorer channel
+    let (tx_to_explorer, rx_from_orchestrator) = unbounded::<OrchestratorToExplorer>();
+
+    // Planet -> Explorer channel.
+    // This sender is stored in ExplorerHandle and given to planets when the explorer moves.
+    let (planet_reply_tx, rx_from_planet) = unbounded::<PlanetToExplorer>();
+
+    let explorer_id = 1;
+
+    let mut explorer = explorer_astronaut::create_explorer(
+        explorer_id,
+        rx_from_orchestrator,
+        explorer_tx.clone(),
+        rx_from_planet,
+        starting_planet_sender,
+        starting_planet,
+    )
+        .expect("failed to create explorer_astronaut");
+
+    let explorer_thread = std::thread::Builder::new()
+        .name(format!("explorer-{explorer_id}"))
+        .spawn(move || {
+            explorer.run();
+        })
+        .expect("failed to spawn explorer thread");
+
+    explorer_registry.insert(ExplorerHandle::new(
+        explorer_id,
+        tx_to_explorer,
+        planet_reply_tx,
+        starting_planet,
+        explorer_thread,
+    ));
+
+    log::info!("Spawned explorer {explorer_id} on planet {starting_planet}");
+
+    // ── Build probability registry and forge ────────────────────────────────────
+    let mut rng = rand::rng();
+
+    let prob_registry = ProbabilityRegistry::new(
+        planet_ids.iter().copied(),
+        &mut rng,
+    );
+
+    let forge = Forge::new().expect("failed to create Forge");
+
+    // ── Build public API ────────────────────────────────────────────────────────
+    let mut api = OrchestratorApi::new(
+        topology,
+        planet_registry,
+        explorer_registry,
+        prob_registry,
+        planet_rx,
+        explorer_rx,
+        forge,
+    );
+
+    if args.auto_start {
+        api.start_logic().unwrap();
+    }
+
+    interactive_loop(&mut api);
 }
 
 /// Holds parsed CLI arguments.
@@ -200,8 +322,10 @@ fn interactive_loop(api: &mut bipolar_orchestrator::api::OrchestratorApi) {
             }
 
             Command::Bag { explorer_id } => {
-                // bag content display is handled once BagContentRequest is wired
-                println!("Bag command for explorer {explorer_id} not yet wired (Vivi).");
+                match api.bag_content(explorer_id) {
+                    Ok(content) => println!("Explorer {explorer_id} bag: {content:?}"),
+                    Err(e) => println!("Error: {e}"),
+                }
             }
 
             Command::PlanetState { planet_id } => match api.planet_state(planet_id) {
