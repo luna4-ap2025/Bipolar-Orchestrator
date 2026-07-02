@@ -31,8 +31,14 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// How often the logic loop ticks (1 second per tick).
-const TICK_INTERVAL: Duration = Duration::from_secs(1);
+/// How often the logic loop ticks.
+///
+/// Was 1 second, which made planets die within a couple of seconds of game
+/// start (barely any time to charge energy cells before a curve swung toward
+/// asteroids). Slowed to 4 seconds; `curves::PERIOD` was scaled by the same
+/// factor so the game keeps the same number of *ticks* per curve phase, just
+/// spread over more real time.
+const TICK_INTERVAL: Duration = Duration::from_secs(4);
 
 /// Signal sent to the logic thread to control it.
 #[derive(Debug, Clone, Copy)]
@@ -189,6 +195,8 @@ fn run_logic_loop(
             let mut planets_guard = planets.lock().unwrap();
             let mut topology_guard = topology.lock().unwrap();
             let planet_rx_guard = planet_rx.lock().unwrap();
+            let mut explorers_guard = explorers.lock().unwrap();
+            let explorer_rx_guard = explorer_rx.lock().unwrap();
 
             let forge_guard = forge.lock().unwrap();
 
@@ -199,6 +207,8 @@ fn run_logic_loop(
                 &mut planets_guard,
                 &mut topology_guard,
                 &planet_rx_guard,
+                &mut explorers_guard,
+                &explorer_rx_guard,
                 &mut rng,
             ) {
                 log::error!("Tick dispatch failed for planet {planet_id}: {e}");

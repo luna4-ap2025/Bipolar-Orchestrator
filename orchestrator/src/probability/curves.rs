@@ -1,26 +1,35 @@
 //! # Probability curves
 //!
-//! Each [`CurveKind`] maps phase time `t` (seconds since last personality flip)
-//! to a sunray probability in `[0.0, 1.0]`. ECLIPSE inverts each curve via
-//! `1.0 - value`, so a curve that starts at 1.0 under SOLACE starts at 0.0
-//! under ECLIPSE.
+//! Each [`CurveKind`] maps phase time `t` (seconds since the last planet
+//! death) to a local "wobble" value in `[0.0, 1.0]` — this is each planet's
+//! own personality, independent of the galaxy's mood.
 //!
-//! All curves are designed to open at >= 0.5 under SOLACE and <= 0.5 under
-//! ECLIPSE, so each personality starts the phase leaning in its expected direction.
+//! That wobble is then blended against its own inverse by the registry's
+//! global `hostility` value (see [`super::ProbabilityRegistry`]): at
+//! `hostility = 0.0` the curve reads as-is (calm), at `hostility = 1.0` it
+//! reads fully inverted (hostile), and in between it's a straight lerp. So
+//! every planet keeps its individual shape while the whole galaxy leans
+//! further toward asteroids as hostility climbs.
 //!
-//! | Kind          | SOLACE t=0 | ECLIPSE t=0 | Shape                            |
-//! |---------------|------------|-------------|----------------------------------|
-//! | `Sine`        | 0.5        | 0.5         | smooth oscillation, neutral open |
-//! | `Cosine`      | 1.0        | 0.0         | smooth oscillation, full open    |
-//! | `Sawtooth`    | 1.0        | 0.0         | linear fall then hard reset      |
-//! | `Triangle`    | 1.0        | 0.0         | falls then rises, symmetric      |
-//! | `Square`      | 1.0        | 0.0         | hard binary alternation          |
-//! | `Exponential` | 1.0        | 0.0         | decays toward 0, no recovery     |
+//! | Kind          | t=0 wobble | Shape                            |
+//! |---------------|------------|-----------------------------------|
+//! | `Sine`        | 0.5        | smooth oscillation, neutral open |
+//! | `Cosine`      | 1.0        | smooth oscillation, full open    |
+//! | `Sawtooth`    | 1.0        | linear fall then hard reset      |
+//! | `Triangle`    | 1.0        | falls then rises, symmetric      |
+//! | `Square`      | 1.0        | hard binary alternation          |
+//! | `Exponential` | 1.0        | decays toward 0, no recovery     |
 
-use super::BipolarMode;
+// Scaled 4x alongside `logic::TICK_INTERVAL` (1s -> 4s) so curves still swing
+// over the same number of ticks, just more slowly in wall-clock time.
+const PERIOD: f64 = 40.0;
+const DECAY_K: f64 = 0.0125;
 
-const PERIOD: f64 = 10.0;
-const DECAY_K: f64 = 0.05;
+// Angular frequency for Sine/Cosine so they complete one full cycle every
+// `PERIOD` seconds, matching Sawtooth/Triangle/Square. Raw `t.sin()`/`t.cos()`
+// (frequency 1 rad/s) would instead cycle every ~6.28s regardless of `PERIOD`,
+// making a Sine/Cosine planet's odds swing almost randomly between 4s ticks.
+const ANGULAR_FREQ: f64 = std::f64::consts::TAU / PERIOD;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CurveKind {
@@ -44,34 +53,32 @@ impl CurveKind {
         ]
     }
 
-    pub fn build(self, mode: BipolarMode) -> ProbabilityCurve {
-        ProbabilityCurve { kind: self, mode }
+    pub fn build(self) -> ProbabilityCurve {
+        ProbabilityCurve { kind: self }
     }
 }
 
 pub struct ProbabilityCurve {
     pub(super) kind: CurveKind,
-    pub(super) mode: BipolarMode,
 }
 
 impl ProbabilityCurve {
-    /// Sunray probability at `t` seconds into the current phase.
+    /// Sunray probability at `t` seconds into the current phase, blended
+    /// against its own inverse by `hostility` (`0.0` = pure wobble, `1.0` =
+    /// fully inverted).
     #[must_use]
-    pub fn evaluate(&self, t: f64) -> f64 {
-        let solace_value = self.evaluate_solace(t);
-        match self.mode {
-            BipolarMode::Solace => solace_value,
-            BipolarMode::Eclipse => 1.0 - solace_value,
-        }
+    pub fn evaluate(&self, t: f64, hostility: f64) -> f64 {
+        let wobble = self.evaluate_wobble(t);
+        wobble + hostility * (1.0 - 2.0 * wobble)
     }
 
-    fn evaluate_solace(&self, t: f64) -> f64 {
+    fn evaluate_wobble(&self, t: f64) -> f64 {
         match self.kind {
-            // (sin(t) + 1) / 2 — oscillates [0, 1], starts at 0.5
-            CurveKind::Sine => (t.sin() + 1.0) / 2.0,
+            // (sin(t) + 1) / 2 — oscillates [0, 1] once per PERIOD, starts at 0.5
+            CurveKind::Sine => ((t * ANGULAR_FREQ).sin() + 1.0) / 2.0,
 
-            // (cos(t) + 1) / 2 — oscillates [0, 1], starts at 1.0
-            CurveKind::Cosine => (t.cos() + 1.0) / 2.0,
+            // (cos(t) + 1) / 2 — oscillates [0, 1] once per PERIOD, starts at 1.0
+            CurveKind::Cosine => ((t * ANGULAR_FREQ).cos() + 1.0) / 2.0,
 
             // 1 - (t mod T) / T — linear fall from 1.0 to 0.0, then hard reset
             CurveKind::Sawtooth => {
@@ -97,7 +104,7 @@ impl ProbabilityCurve {
             }
 
             // e^(-k*t) — starts at 1.0, decays toward 0 with no recovery.
-            // Uses phase_elapsed so it always resets to 1.0 on personality flip.
+            // Uses phase_elapsed so it always resets to 1.0 on planet death.
             CurveKind::Exponential => (-DECAY_K * t).exp(),
         }
     }
@@ -107,14 +114,13 @@ impl ProbabilityCurve {
 mod tests {
     use super::*;
 
-    fn solace(kind: CurveKind) -> ProbabilityCurve { kind.build(BipolarMode::Solace) }
-    fn eclipse(kind: CurveKind) -> ProbabilityCurve { kind.build(BipolarMode::Eclipse) }
+    fn calm(kind: CurveKind) -> ProbabilityCurve { kind.build() }
 
     #[test]
     fn all_curves_return_values_in_unit_interval() {
         for kind in CurveKind::all() {
             for t in [0.0_f64, 1.0, 5.0, 10.0, 100.0] {
-                let v = solace(kind).evaluate(t);
+                let v = calm(kind).evaluate(t, 0.0);
                 assert!(
                     (0.0..=1.0).contains(&v),
                     "{kind:?} at t={t} returned {v} outside [0,1]"
@@ -124,52 +130,62 @@ mod tests {
     }
 
     #[test]
-    fn eclipse_inverts_solace() {
+    fn full_hostility_inverts_wobble() {
         for kind in CurveKind::all() {
             let t = 3.7_f64;
-            let s = solace(kind).evaluate(t);
-            let e = eclipse(kind).evaluate(t);
+            let calm_v = calm(kind).evaluate(t, 0.0);
+            let hostile_v = calm(kind).evaluate(t, 1.0);
             assert!(
-                (s + e - 1.0).abs() < 1e-10,
-                "{kind:?}: solace={s} + eclipse={e} should sum to 1"
+                (calm_v + hostile_v - 1.0).abs() < 1e-10,
+                "{kind:?}: calm={calm_v} + hostile={hostile_v} should sum to 1"
             );
         }
     }
 
     #[test]
-    fn solace_curves_start_high_or_neutral() {
+    fn zero_hostility_starts_high_or_neutral() {
         for kind in CurveKind::all() {
-            let v = solace(kind).evaluate(0.0);
-            assert!(v >= 0.5, "{kind:?} SOLACE starts at {v}, expected >= 0.5");
+            let v = calm(kind).evaluate(0.0, 0.0);
+            assert!(v >= 0.5, "{kind:?} at hostility=0 starts at {v}, expected >= 0.5");
         }
     }
 
     #[test]
-    fn eclipse_curves_start_low_or_neutral() {
+    fn full_hostility_starts_low_or_neutral() {
         for kind in CurveKind::all() {
-            let v = eclipse(kind).evaluate(0.0);
-            assert!(v <= 0.5, "{kind:?} ECLIPSE starts at {v}, expected <= 0.5");
+            let v = calm(kind).evaluate(0.0, 1.0);
+            assert!(v <= 0.5, "{kind:?} at hostility=1 starts at {v}, expected <= 0.5");
         }
     }
 
     #[test]
     fn exponential_starts_at_one_and_decays() {
-        let c = solace(CurveKind::Exponential);
-        assert!((c.evaluate(0.0) - 1.0).abs() < 1e-10);
-        assert!(c.evaluate(0.0) > c.evaluate(100.0));
+        let c = calm(CurveKind::Exponential);
+        assert!((c.evaluate(0.0, 0.0) - 1.0).abs() < 1e-10);
+        assert!(c.evaluate(0.0, 0.0) > c.evaluate(100.0, 0.0));
     }
 
     #[test]
     fn sawtooth_starts_at_one_and_falls() {
-        let c = solace(CurveKind::Sawtooth);
-        assert!((c.evaluate(0.0) - 1.0).abs() < 1e-10);
-        assert!(c.evaluate(5.0) < c.evaluate(0.0));
+        let c = calm(CurveKind::Sawtooth);
+        assert!((c.evaluate(0.0, 0.0) - 1.0).abs() < 1e-10);
+        assert!(c.evaluate(5.0, 0.0) < c.evaluate(0.0, 0.0));
     }
 
     #[test]
     fn triangle_starts_at_one_and_falls_first() {
-        let c = solace(CurveKind::Triangle);
-        assert!((c.evaluate(0.0) - 1.0).abs() < 1e-10);
-        assert!(c.evaluate(2.5) < c.evaluate(0.0));
+        let c = calm(CurveKind::Triangle);
+        assert!((c.evaluate(0.0, 0.0) - 1.0).abs() < 1e-10);
+        assert!(c.evaluate(2.5, 0.0) < c.evaluate(0.0, 0.0));
+    }
+
+    #[test]
+    fn intermediate_hostility_lerps_between_wobble_and_inverse() {
+        let c = calm(CurveKind::Cosine);
+        let t = 0.0;
+        let wobble = c.evaluate(t, 0.0);
+        let mid = c.evaluate(t, 0.5);
+        assert!((mid - 0.5).abs() < 1e-10, "midpoint hostility should read neutral, got {mid}");
+        assert!(wobble > mid);
     }
 }

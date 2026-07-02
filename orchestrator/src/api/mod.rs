@@ -11,6 +11,7 @@
 
 pub mod commands;
 
+use crate::ack::recv_ack;
 use crate::error::OrchestratorError;
 use crate::explorer::ExplorerRegistry;
 use crate::galaxy::Topology;
@@ -104,7 +105,8 @@ impl OrchestratorApi {
             }
         }
 
-        // Wait for all StartPlanetAIResult acks
+        // Wait for all StartPlanetAIResult acks, discarding stray messages
+        // left over on the shared receiver rather than misreading them.
         let mut pending_planets: std::collections::HashSet<ID> = {
             let planets = self.planets.lock().unwrap();
             planets.iter().map(|h| h.id()).collect()
@@ -112,27 +114,25 @@ impl OrchestratorApi {
 
         while !pending_planets.is_empty() {
             let rx = self.planet_rx.lock().unwrap();
-
-            match rx.recv_timeout(API_TIMEOUT) {
-                Ok(PlanetToOrchestrator::StartPlanetAIResult { planet_id }) => {
-                    pending_planets.remove(&planet_id);
-                }
-
-                Ok(other) => {
-                    return Err(OrchestratorError::ChannelError(format!(
-                        "Expected StartPlanetAIResult, got {other:?}"
-                    )));
-                }
-
-                Err(_) => {
-                    return Err(OrchestratorError::ChannelError(
-                        "Timeout waiting for StartPlanetAIResult".to_string(),
-                    ));
-                }
-            }
+            let planet_id = recv_ack(
+                &rx,
+                API_TIMEOUT,
+                "StartPlanetAIResult",
+                |msg| match msg {
+                    PlanetToOrchestrator::StartPlanetAIResult { planet_id }
+                        if pending_planets.contains(&planet_id) =>
+                    {
+                        Ok(planet_id)
+                    }
+                    other => Err(other),
+                },
+            )?;
+            pending_planets.remove(&planet_id);
         }
 
-        // Wait for all StartExplorerAIResult acks
+        // Wait for all StartExplorerAIResult acks, discarding stray messages
+        // (e.g. a leftover StopExplorerAIResult from a just-preceding pause)
+        // rather than misreading them as a fatal protocol error.
         let mut pending_explorers: std::collections::HashSet<ID> = {
             let explorers = self.explorers.lock().unwrap();
             explorers.iter().map(|h| h.id()).collect()
@@ -140,24 +140,20 @@ impl OrchestratorApi {
 
         while !pending_explorers.is_empty() {
             let rx = self.explorer_rx.lock().unwrap();
-
-            match rx.recv_timeout(API_TIMEOUT) {
-                Ok(ExplorerToOrchestrator::StartExplorerAIResult { explorer_id }) => {
-                    pending_explorers.remove(&explorer_id);
-                }
-
-                Ok(other) => {
-                    return Err(OrchestratorError::ChannelError(format!(
-                        "Expected StartExplorerAIResult, got {other:?}"
-                    )));
-                }
-
-                Err(_) => {
-                    return Err(OrchestratorError::ChannelError(
-                        "Timeout waiting for StartExplorerAIResult".to_string(),
-                    ));
-                }
-            }
+            let explorer_id = recv_ack(
+                &rx,
+                API_TIMEOUT,
+                "StartExplorerAIResult",
+                |msg| match msg {
+                    ExplorerToOrchestrator::StartExplorerAIResult { explorer_id }
+                        if pending_explorers.contains(&explorer_id) =>
+                    {
+                        Ok(explorer_id)
+                    }
+                    other => Err(other),
+                },
+            )?;
+            pending_explorers.remove(&explorer_id);
         }
 
         self.logic.start(
@@ -171,16 +167,73 @@ impl OrchestratorApi {
         )
     }
 
-    /// Stops the autonomous game logic loop and pauses all explorer AIs.
+    /// Stops the autonomous game logic loop and pauses all explorer and planet AIs.
+    ///
+    /// Planets must actually transition to their stopped state here (not just
+    /// have the tick thread go quiet) — a running planet silently ignores a
+    /// second `StartPlanetAI` with no ack (see `Planet::handle_orchestrator_msg`),
+    /// so without this a later [`Self::start_logic`] would hang waiting for an
+    /// ack that never comes.
     ///
     /// # Errors
     /// Returns [`OrchestratorError::InvalidState`] if not running.
     pub fn stop_logic(&mut self) -> Result<(), OrchestratorError> {
         self.logic.stop()?;
 
-        let explorers = self.explorers.lock().unwrap();
-        for h in explorers.iter() {
-            let _ = h.send(OrchestratorToExplorer::StopExplorerAI);
+        let mut pending_explorers: std::collections::HashSet<ID> = {
+            let explorers = self.explorers.lock().unwrap();
+            for h in explorers.iter() {
+                let _ = h.send(OrchestratorToExplorer::StopExplorerAI);
+            }
+            explorers.iter().map(|h| h.id()).collect()
+        };
+
+        // Wait for these acks now (rather than firing and forgetting) so a
+        // leftover StopExplorerAIResult can't later be misread as the
+        // StartExplorerAIResult a subsequent `start_logic` is waiting for.
+        while !pending_explorers.is_empty() {
+            let rx = self.explorer_rx.lock().unwrap();
+            let explorer_id = recv_ack(
+                &rx,
+                API_TIMEOUT,
+                "StopExplorerAIResult",
+                |msg| match msg {
+                    ExplorerToOrchestrator::StopExplorerAIResult { explorer_id }
+                        if pending_explorers.contains(&explorer_id) =>
+                    {
+                        Ok(explorer_id)
+                    }
+                    other => Err(other),
+                },
+            )?;
+            pending_explorers.remove(&explorer_id);
+        }
+
+        let mut pending_planets: std::collections::HashSet<ID> = {
+            let planets = self.planets.lock().unwrap();
+            for h in planets.iter() {
+                h.send(OrchestratorToPlanet::StopPlanetAI)
+                    .map_err(OrchestratorError::ChannelError)?;
+            }
+            planets.iter().map(|h| h.id()).collect()
+        };
+
+        while !pending_planets.is_empty() {
+            let rx = self.planet_rx.lock().unwrap();
+            let planet_id = recv_ack(
+                &rx,
+                API_TIMEOUT,
+                "StopPlanetAIResult",
+                |msg| match msg {
+                    PlanetToOrchestrator::StopPlanetAIResult { planet_id }
+                        if pending_planets.contains(&planet_id) =>
+                    {
+                        Ok(planet_id)
+                    }
+                    other => Err(other),
+                },
+            )?;
+            pending_planets.remove(&planet_id);
         }
 
         Ok(())
@@ -206,18 +259,26 @@ impl OrchestratorApi {
         }
 
         let rx = self.planet_rx.lock().unwrap();
-        match rx.recv_timeout(API_TIMEOUT) {
-            Ok(PlanetToOrchestrator::SunrayAck { planet_id: ack_id }) => {
-                log::info!("Manual sunray: SunrayAck from planet {ack_id}");
-                Ok(())
-            }
-            Ok(other) => Err(OrchestratorError::ChannelError(format!(
-                "Expected SunrayAck, got {other:?}"
-            ))),
-            Err(_) => Err(OrchestratorError::ChannelError(format!(
-                "Timeout waiting for SunrayAck from planet {planet_id}"
-            ))),
+        let result = recv_ack(
+            &rx,
+            API_TIMEOUT,
+            &format!("SunrayAck from planet {planet_id}"),
+            |msg| match msg {
+                PlanetToOrchestrator::SunrayAck { planet_id: id } if id == planet_id => Ok(()),
+                other => Err(other),
+            },
+        )
+        .inspect(|()| log::info!("Manual sunray: SunrayAck from planet {planet_id}"));
+
+        if result.is_ok() {
+            // "Infiltrating the orchestrator's mind" — a manual sunray nudges
+            // the whole galaxy's mood back toward calm, not just this planet.
+            self.prob_registry
+                .lock()
+                .unwrap()
+                .nudge_hostility(-crate::probability::MANUAL_OVERRIDE_NUDGE);
         }
+        result
     }
 
     /// Manually sends an asteroid to `planet_id` and handles the result.
@@ -241,28 +302,48 @@ impl OrchestratorApi {
                 .map_err(OrchestratorError::ChannelError)?;
         }
 
-        let ack = {
+        let rocket = {
             let rx = self.planet_rx.lock().unwrap();
-            rx.recv_timeout(API_TIMEOUT)
-                .map_err(|_| OrchestratorError::ChannelError(format!("AsteroidAck timeout for planet {planet_id}")))?
+            recv_ack(
+                &rx,
+                API_TIMEOUT,
+                &format!("AsteroidAck from planet {planet_id}"),
+                |msg| match msg {
+                    PlanetToOrchestrator::AsteroidAck { planet_id: id, rocket } if id == planet_id => {
+                        Ok(rocket)
+                    }
+                    other => Err(other),
+                },
+            )?
         };
 
-        match ack {
-            PlanetToOrchestrator::AsteroidAck { rocket, .. } => {
-                let survived = rocket.is_some();
-                if !survived {
-                    log::warn!("Planet {planet_id} destroyed by manual asteroid");
-                    let mut planets = self.planets.lock().unwrap();
-                    let mut topo = self.topology.lock().unwrap();
-                    let mut prob = self.prob_registry.lock().unwrap();
-                    crate::logic::tick::destroy_planet(planet_id, &mut planets, &mut topo, &mut prob, &mut rand::rng())?;
-                }
-                Ok(survived)
-            }
-            other => Err(OrchestratorError::ChannelError(format!(
-                "Expected AsteroidAck, got {other:?}"
-            ))),
+        let survived = rocket.is_some();
+        if !survived {
+            log::warn!("Planet {planet_id} destroyed by manual asteroid");
+            let mut planets = self.planets.lock().unwrap();
+            let mut topo = self.topology.lock().unwrap();
+            let mut prob = self.prob_registry.lock().unwrap();
+            let mut explorers = self.explorers.lock().unwrap();
+            let explorer_rx = self.explorer_rx.lock().unwrap();
+            crate::logic::tick::destroy_planet(
+                planet_id,
+                &mut planets,
+                &mut topo,
+                &mut prob,
+                &mut explorers,
+                &explorer_rx,
+                &mut rand::rng(),
+            )?;
+            // on_planet_death already reset hostility to 0 above; no extra nudge needed.
+        } else {
+            // "Infiltrating the orchestrator's mind" — a manual asteroid nudges
+            // the whole galaxy's mood toward hostility, not just this planet.
+            self.prob_registry
+                .lock()
+                .unwrap()
+                .nudge_hostility(crate::probability::MANUAL_OVERRIDE_NUDGE);
         }
+        Ok(survived)
     }
 
     /// Manually moves `explorer_id` to `planet_id`.

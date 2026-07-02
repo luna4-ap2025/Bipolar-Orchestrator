@@ -1,0 +1,147 @@
+{ "frames": [
+   {
+    "filename": "cockpit (window).aseprite",
+    "frame": { "x": 0, "y": 0, "w": 1600, "h": 900 },
+    "rotated": false,
+    "trimmed": false,
+    "spriteSourceSize": { "x": 0, "y": 0, "w": 1600, "h": 900 },
+    "sourceSize": { "w": 1600, "h": 900 },
+    "duration": 100
+   },
+   {
+    "filename": "cockpit (top screen).aseprite",
+    "frame": { "x": 1600, "y": 0, "w": 1600, "h": 900 },
+    "rotated": false,
+    "trimmed": false,
+    "spriteSourceSize": { "x": 0, "y": 0, "w": 1600, "h": 900 },
+    "sourceSize": { "w": 1600, "h": 900 },
+    "duration": 100
+   },
+   {
+    "filename": "cockpit (bottom screen).aseprite",
+    "frame": { "x": 3200, "y": 0, "w": 1600, "h": 900 },
+    "rotated": false,
+    "trimmed": false,
+    "spriteSourceSize": { "x": 0, "y": 0, "w": 1600, "h": 900 },
+    "sourceSize": { "w": 1600, "h": 900 },
+    "duration": 100
+   },
+   {
+    "filename": "cockpit (chronicle screen).aseprite",
+    "frame": { "x": 4800, "y": 0, "w": 1600, "h": 900 },
+    "rotated": false,
+    "trimmed": false,
+    "spriteSourceSize": { "x": 0, "y": 0, "w": 1600, "h": 900 },
+    "sourceSize": { "w": 1600, "h": 900 },
+    "duration": 100
+   },
+   {
+    "filename": "cockpit (buttons).aseprite",
+    "frame": { "x": 0, "y": 900, "w": 1600, "h": 900 },
+    "rotated": false,
+    "trimmed": false,
+    "spriteSourceSize": { "x": 0, "y": 0, "w": 1600, "h": 900 },
+    "sourceSize": { "w": 1600, "h": 900 },
+    "duration": 100
+   },
+   {
+    "filename": "cockpit (start).aseprite",
+    "frame": { "x": 1600, "y": 900, "w": 1600, "h": 900 },
+    "rotated": false,
+    "trimmed": false,
+    "spriteSourceSize": { "x": 0, "y": 0, "w": 1600, "h": 900 },
+    "sourceSize": { "w": 1600, "h": 900 },
+    "duration": 100
+   },
+   {
+    "filename": "cockpit (pause).aseprite",
+    "frame": { "x": 3200, "y": 900, "w": 1600, "h": 900 },
+    "rotated": false,
+    "trimmed": false,
+    "spriteSourceSize": { "x": 0, "y": 0, "w": 1600, "h": 900 },
+    "sourceSize": { "w": 1600, "h": 900 },
+    "duration": 100
+   },
+   {
+    "filename": "cockpit (resume).aseprite",
+    "frame": { "x": 4800, "y": 900, "w": 1600, "h": 900 },
+    "rotated": false,
+    "trimmed": false,
+    "spriteSourceSize": { "x": 0, "y": 0, "w": 1600, "h": 900 },
+    "sourceSize": { "w": 1600, "h": 900 },
+    "duration": 100
+   },
+   {
+    "filename": "cockpit (sunray).aseprite",
+    "frame": { "x": 0, "y": 1800, "w": 1600, "h": 900 },
+    "rotated": false,
+    "trimmed": false,
+    "spriteSourceSize": { "x": 0, "y": 0, "w": 1600, "h": 900 },
+    "sourceSize": { "w": 1600, "h": 900 },
+    "duration": 100
+   },
+   {
+    "filename": "cockpit (asteroid).aseprite",
+    "frame": { "x": 1600, "y": 1800, "w": 1600, "h": 900 },
+    "rotated": false,
+    "trimmed": false,
+    "spriteSourceSize": { "x": 0, "y": 0, "w": 1600, "h": 900 },
+    "sourceSize": { "w": 1600, "h": 900 },
+    "duration": 100
+   },
+   {
+    "filename": "cockpit (move).aseprite",
+    "frame": { "x": 3200, "y": 1800, "w": 1600, "h": 900 },
+    "rotated": false,
+    "trimmed": false,
+    "spriteSourceSize": { "x": 0, "y": 0, "w": 1600, "h": 900 },
+    "sourceSize": { "w": 1600, "h": 900 },
+    "duration": 100
+   },
+   {
+    "filename": "cockpit (hologram left).aseprite",
+    "frame": { "x": 4800, "y": 1800, "w": 1600, "h": 900 },
+    "rotated": false,
+    "trimmed": false,
+    "spriteSourceSize": { "x": 0, "y": 0, "w": 1600, "h": 900 },
+    "sourceSize": { "w": 1600, "h": 900 },
+    "duration": 100
+   },
+   {
+    "filename": "cockpit (hologram right).aseprite",
+    "frame": { "x": 0, "y": 2700, "w": 1600, "h": 900 },
+    "rotated": false,
+    "trimmed": false,
+    "spriteSourceSize": { "x": 0, "y": 0, "w": 1600, "h": 900 },
+    "sourceSize": { "w": 1600, "h": 900 },
+    "duration": 100
+   }
+ ],
+ "meta": {
+  "app": "https://www.aseprite.org/",
+  "version": "1.3.17.2-dev",
+  "image": "cockpit.png",
+  "format": "RGBA8888",
+  "size": { "w": 6400, "h": 3600 },
+  "scale": "1",
+  "frameTags": [
+  ],
+  "layers": [
+   { "name": "window", "opacity": 255, "blendMode": "normal" },
+   { "name": "top screen", "opacity": 255, "blendMode": "normal" },
+   { "name": "bottom screen", "opacity": 255, "blendMode": "normal" },
+   { "name": "chronicle screen", "opacity": 255, "blendMode": "normal" },
+   { "name": "buttons", "opacity": 255, "blendMode": "normal" },
+   { "name": "start", "opacity": 255, "blendMode": "normal" },
+   { "name": "pause", "opacity": 255, "blendMode": "normal" },
+   { "name": "resume", "opacity": 255, "blendMode": "normal" },
+   { "name": "sunray", "opacity": 255, "blendMode": "normal" },
+   { "name": "asteroid", "opacity": 255, "blendMode": "normal" },
+   { "name": "move", "opacity": 255, "blendMode": "normal" },
+   { "name": "hologram left", "opacity": 255, "blendMode": "normal" },
+   { "name": "hologram right", "opacity": 255, "blendMode": "normal" }
+  ],
+  "slices": [
+  ]
+ }
+}

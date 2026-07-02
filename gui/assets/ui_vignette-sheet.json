@@ -1,0 +1,27 @@
+{ "frames": [
+   {
+    "filename": "ui_vignette.png",
+    "frame": { "x": 0, "y": 0, "w": 320, "h": 180 },
+    "rotated": false,
+    "trimmed": false,
+    "spriteSourceSize": { "x": 0, "y": 0, "w": 320, "h": 180 },
+    "sourceSize": { "w": 320, "h": 180 },
+    "duration": 100
+   }
+ ],
+ "meta": {
+  "app": "https://www.aseprite.org/",
+  "version": "1.3.17.2-dev",
+  "image": "ui_vignette-sheet.png",
+  "format": "RGBA8888",
+  "size": { "w": 320, "h": 180 },
+  "scale": "1",
+  "frameTags": [
+  ],
+  "layers": [
+   { "name": "Layer", "opacity": 255, "blendMode": "normal" }
+  ],
+  "slices": [
+  ]
+ }
+}

@@ -28,4 +28,6 @@ planet = { git = "https://github.com/crabtorio/crabtorio.git" }
 Planet = { git = "https://github.com/Houston-we-have-a-borrow/Planet.git" }
 enterprise = { git = "https://github.com/Thompspsps/Enterprise_planet.git" }
 
+bipolar-shared = { path = "../shared" }
+
 [dev-dependencies]

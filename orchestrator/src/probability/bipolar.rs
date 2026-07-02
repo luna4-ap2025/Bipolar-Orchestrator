@@ -1,13 +1,12 @@
-//! # Bipolar mode tracker
+//! # Bipolar mode label
 //!
-//! Tracks which orchestrator personality is currently active: SOLACE (nurturing,
-//! sunray-biased) or ECLIPSE (destructive, asteroid-biased). Flips on every
-//! planet death.
+//! `BipolarMode` is a *derived* label for which orchestrator personality is
+//! dominant right now — it no longer drives probability math directly. The
+//! real driver is [`super::ProbabilityRegistry`]'s continuous `hostility`
+//! value; this enum just buckets that value into SOLACE (< 0.5, nurturing,
+//! sunray-biased) or ECLIPSE (>= 0.5, destructive, asteroid-biased) for logs
+//! and GUI text.
 
-/// The active orchestrator personality.
-///
-/// `Solace`: curves run as assigned, sunray probability is high.
-/// `Eclipse`: every curve is inverted (`1.0 - value`), asteroid probability is high.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BipolarMode {
     Solace,
@@ -15,15 +14,12 @@ pub enum BipolarMode {
 }
 
 impl BipolarMode {
-    /// Returns the opposite personality.
-    pub fn next(self) -> Self {
-        match self {
-            Self::Solace => Self::Eclipse,
-            Self::Eclipse => Self::Solace,
-        }
+    /// Buckets a continuous hostility value in `[0.0, 1.0]` into a dominant label.
+    pub fn from_hostility(hostility: f64) -> Self {
+        if hostility >= 0.5 { Self::Eclipse } else { Self::Solace }
     }
 
-    /// Returns `true` if ECLIPSE is currently in control.
+    /// Returns `true` if ECLIPSE is currently dominant.
     pub fn is_eclipse(self) -> bool {
         matches!(self, Self::Eclipse)
     }
@@ -34,9 +30,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn toggles_correctly() {
-        let m = BipolarMode::Solace;
-        assert_eq!(m.next(), BipolarMode::Eclipse);
-        assert_eq!(m.next().next(), BipolarMode::Solace);
+    fn buckets_by_threshold() {
+        assert_eq!(BipolarMode::from_hostility(0.0), BipolarMode::Solace);
+        assert_eq!(BipolarMode::from_hostility(0.49), BipolarMode::Solace);
+        assert_eq!(BipolarMode::from_hostility(0.5), BipolarMode::Eclipse);
+        assert_eq!(BipolarMode::from_hostility(1.0), BipolarMode::Eclipse);
     }
 }
