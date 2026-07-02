@@ -197,6 +197,12 @@ const PORTRAIT_BUBBLE_SIZE: f32 = 128.0 * DISPLAY_SCALE;
 const SOLACE_INNER_SIZE: f32 = 84.0 * DISPLAY_SCALE;
 const ECLIPSE_INNER_SIZE: f32 = 96.0 * DISPLAY_SCALE;
 
+/// The stance sprite is a standing full-body figure for whichever personality
+/// currently controls the shared body — rendered at the same box size as the
+/// portrait bubbles, directly beneath them (Solace's stays on the left,
+/// Eclipse's on the right, matching each one's portrait).
+const STANCE_SIZE: f32 = PORTRAIT_BUBBLE_SIZE;
+
 #[derive(Component)]
 struct TopBarPersonalityText;
 
@@ -548,6 +554,73 @@ struct PortraitReaction {
     priority: bool,
 }
 
+// ── Animation tags (loaded from the Aseprite JSON exports) ────────────────────
+//
+// solace.json/eclipse.json each ship a `meta.frameTags` array naming every
+// animation ("idle", "sending", "unwanted_event", "breaking", "awakening",
+// etc.) with its frame range. Frame ranges used to be hand-copied into the
+// event-dispatch match arms below as bare numbers — correct today, but silently
+// stale the moment either sheet is ever re-exported with a different frame
+// count, with no compiler error to catch it. Reading the tag names by name
+// from the JSON at startup means the source of truth is the export itself.
+#[derive(serde::Deserialize)]
+struct AsepriteFrameTag {
+    name: String,
+    from: usize,
+    to: usize,
+}
+
+#[derive(serde::Deserialize)]
+struct AsepriteMeta {
+    #[serde(rename = "frameTags")]
+    frame_tags: Vec<AsepriteFrameTag>,
+}
+
+#[derive(serde::Deserialize)]
+struct AsepriteExport {
+    meta: AsepriteMeta,
+}
+
+#[derive(Resource)]
+struct AnimTags {
+    solace: HashMap<String, (usize, usize)>,
+    eclipse: HashMap<String, (usize, usize)>,
+}
+
+impl AnimTags {
+    /// Reads `solace.json`/`eclipse.json` straight from the assets folder —
+    /// the same folder Bevy's own asset server resolves `asset_server.load`
+    /// paths against (`CARGO_MANIFEST_DIR`/assets in dev builds), so this
+    /// stays in lockstep with whatever sheet is actually being rendered.
+    fn load() -> Self {
+        Self {
+            solace: Self::load_one("solace.json"),
+            eclipse: Self::load_one("eclipse.json"),
+        }
+    }
+
+    fn load_one(file: &str) -> HashMap<String, (usize, usize)> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets").join(file);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read animation tags from {path:?}: {e}"));
+        let export: AsepriteExport = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("failed to parse animation tags from {path:?}: {e}"));
+        export.meta.frame_tags.into_iter().map(|t| (t.name, (t.from, t.to))).collect()
+    }
+
+    /// Frame range for a named tag on `personality`'s sheet. Panics on an
+    /// unrecognized tag — a typo here should fail loudly at startup instead
+    /// of silently playing nothing (or the wrong frames).
+    fn get(&self, personality: &Personality, tag: &str) -> (usize, usize) {
+        let map = match personality {
+            Personality::Solace => &self.solace,
+            Personality::Eclipse => &self.eclipse,
+        };
+        *map.get(tag)
+            .unwrap_or_else(|| panic!("unknown animation tag {tag:?} for {personality:?} — check solace.json/eclipse.json's frameTags"))
+    }
+}
+
 struct PlanetReaction {
     planet_id: u32,
     first: usize,
@@ -577,6 +650,29 @@ struct DriftBob {
 /// fades in, the other fades out — same crossfade idea as the vignette tint.
 #[derive(Component)]
 struct NebulaTag(Personality);
+
+/// Marks one of the two stance sprites (the standing full-body figure for a
+/// personality). Unlike the portrait bubbles — which are both always visible,
+/// just dimmed/brightened by dominance — only ONE stance is ever shown: the
+/// shared body has a single physical presence, so there can never be two
+/// stances visible at once. `sync_stance_visibility` hides whichever tag
+/// doesn't match the currently active personality.
+#[derive(Component)]
+struct StanceTag(Personality);
+
+/// Drives the small 4-frame standing-idle loop on a stance sprite. Separate
+/// from `PortraitConfig`/`AnimationConfig` since a stance never reacts to
+/// events or plays one-shots — it just idles forever while visible.
+#[derive(Component)]
+struct StanceAnim {
+    timer: Timer,
+}
+
+impl Default for StanceAnim {
+    fn default() -> Self {
+        Self { timer: Timer::from_seconds(1.0 / 6.0, TimerMode::Repeating) }
+    }
+}
 
 /// Periodic brightness pulse for "flashing" bright stars.
 #[derive(Component)]
@@ -738,6 +834,7 @@ fn main() {
         .insert_resource(Selection::default())
         .insert_resource(Inspecting::default())
         .insert_resource(inspection)
+        .insert_resource(AnimTags::load())
         .insert_resource(PlanetNames::load())
         .insert_resource(LogicRunState::NotStarted)
         .insert_resource(ShootingStarTimer::default())
@@ -769,7 +866,7 @@ fn main() {
                 cockpit_button_hover,
             ),
         )
-        .add_systems(Update, (sync_hologram_visibility, sync_hologram_content, sync_explorers, sync_action_buttons_enabled, sync_selection_validity))
+        .add_systems(Update, (sync_hologram_visibility, sync_hologram_content, sync_explorers, sync_action_buttons_enabled, sync_selection_validity, sync_stance_visibility, drive_stance_anim))
         .add_systems(
             Update,
             (
@@ -858,6 +955,7 @@ fn drain_ui_commands(
 
 fn poll_snapshot(
     live: Res<LiveSnapshot>,
+    tags: Res<AnimTags>,
     mut state: ResMut<GalaxyState>,
     mut queue: ResMut<PortraitEventQueue>,
     mut planet_queue: ResMut<PlanetReactionQueue>,
@@ -877,12 +975,14 @@ fn poll_snapshot(
     let new_personality = snap.personality.clone();
 
     if new_personality != state.personality {
-        // SOLACE->ECLIPSE: Solace breaks (30-33), Eclipse awakens (33-35)
-        // ECLIPSE->SOLACE: Eclipse breaks (29-32), Solace awakens (34-36)
-        let (loser, loser_break, winner, winner_awaken) = match &new_personality {
-            Personality::Eclipse => (Personality::Solace, (30, 33), Personality::Eclipse, (33, 35)),
-            Personality::Solace  => (Personality::Eclipse, (29, 32), Personality::Solace,  (34, 36)),
+        // The loser's "breaking" plays, the winner's "awakening" plays —
+        // frame ranges read from each sheet's own JSON export, not hand-copied.
+        let (loser, winner) = match &new_personality {
+            Personality::Eclipse => (Personality::Solace, Personality::Eclipse),
+            Personality::Solace  => (Personality::Eclipse, Personality::Solace),
         };
+        let loser_break = tags.get(&loser, "breaking");
+        let winner_awaken = tags.get(&winner, "awakening");
         queue.0.push_back(PortraitReaction { target: loser,  first: loser_break.0,  last: loser_break.1,  priority: true });
         queue.0.push_back(PortraitReaction { target: winner, first: winner_awaken.0, last: winner_awaken.1, priority: true });
     }
@@ -891,10 +991,13 @@ fn poll_snapshot(
     for event in &events {
         match event {
             GalaxyEvent::SunraySent { .. } => {
-                let (first, last) = match state.personality {
-                    Personality::Solace  => (8, 11),   // Solace: sending
-                    Personality::Eclipse => (15, 18),  // Eclipse: unwanted_event
+                // Solace reacts by "sending"; Eclipse's sunray is unwelcome —
+                // her "unwanted_event" tag.
+                let tag = match state.personality {
+                    Personality::Solace  => "sending",
+                    Personality::Eclipse => "unwanted_event",
                 };
+                let (first, last) = tags.get(&state.personality, tag);
                 queue.0.push_back(PortraitReaction {
                     target: state.personality.clone(), first, last, priority: false,
                 });
@@ -902,8 +1005,9 @@ fn poll_snapshot(
             GalaxyEvent::SunrayReceived { planet_id } => {
                 if state.personality == Personality::Solace {
                     // Sunray landed — Solace is happy
+                    let (first, last) = tags.get(&Personality::Solace, "satisfied");
                     queue.0.push_back(PortraitReaction {
-                        target: Personality::Solace, first: 12, last: 15, priority: false,
+                        target: Personality::Solace, first, last, priority: false,
                     });
                 }
                 planet_queue.0.push_back(PlanetReaction { planet_id: *planet_id, first: 11, last: 13 });
@@ -914,10 +1018,11 @@ fn poll_snapshot(
                 // instead of waiting its turn, so it's never buried behind
                 // routine sunray reactions and missed. Eclipse's "sending" is
                 // routine, stays low priority.
-                let (first, last, priority) = match state.personality {
-                    Personality::Eclipse => (7, 10, false),
-                    Personality::Solace  => (16, 19, true),
+                let (tag, priority) = match state.personality {
+                    Personality::Eclipse => ("sending", false),
+                    Personality::Solace  => ("unwanted_event", true),
                 };
+                let (first, last) = tags.get(&state.personality, tag);
                 queue.0.push_back(PortraitReaction {
                     target: state.personality.clone(), first, last, priority,
                 });
@@ -925,8 +1030,9 @@ fn poll_snapshot(
             GalaxyEvent::AsteroidDeflected { planet_id } => {
                 if state.personality == Personality::Eclipse {
                     // Asteroid hit — Eclipse is satisfied
+                    let (first, last) = tags.get(&Personality::Eclipse, "satisfied");
                     queue.0.push_back(PortraitReaction {
-                        target: Personality::Eclipse, first: 11, last: 14, priority: false,
+                        target: Personality::Eclipse, first, last, priority: false,
                     });
                 }
                 planet_queue.0.push_back(PlanetReaction { planet_id: *planet_id, first: 8, last: 10 });
@@ -1282,6 +1388,29 @@ fn drive_portraits(
                 }
             } else {
                 atlas.index += 1;
+            }
+        }
+    }
+}
+
+/// Shows only the active personality's stance, hiding the other — the shared
+/// body can only physically be standing as one personality at a time, unlike
+/// the portrait bubbles (which are both always on screen, just dimmed).
+fn sync_stance_visibility(state: Res<GalaxyState>, mut query: Query<(&StanceTag, &mut Visibility)>) {
+    for (tag, mut vis) in &mut query {
+        *vis = if tag.0 == state.personality { Visibility::Visible } else { Visibility::Hidden };
+    }
+}
+
+/// Loops the 4-frame standing-idle animation on whichever stance is currently
+/// visible. Runs unconditionally on both (cheap, and keeps the hidden one's
+/// frame in sync so there's no visible jump the instant it reappears).
+fn drive_stance_anim(time: Res<Time>, mut query: Query<(&mut StanceAnim, &mut ImageNode)>) {
+    for (mut anim, mut image) in &mut query {
+        anim.timer.tick(time.delta());
+        if anim.timer.just_finished() {
+            if let Some(atlas) = &mut image.texture_atlas {
+                atlas.index = if atlas.index >= 3 { 0 } else { atlas.index + 1 };
             }
         }
     }
@@ -1920,6 +2049,10 @@ fn spawn_cockpit_ui(
 ) {
     let solace_layout = layouts.add(TextureAtlasLayout::from_grid(UVec2::new(128, 128), 37, 1, None, None));
     let eclipse_layout = layouts.add(TextureAtlasLayout::from_grid(UVec2::new(128, 128), 36, 1, None, None));
+    // Both stance sheets are a plain 4-frame idle loop (128x128 per frame,
+    // confirmed against solace_stance.json/eclipse_stance.json's own "stance"
+    // tag, frames 0-3) — one shared layout works for either.
+    let stance_layout = layouts.add(TextureAtlasLayout::from_grid(UVec2::new(128, 128), 4, 1, None, None));
 
     commands
         .spawn(Node {
@@ -2033,6 +2166,33 @@ fn spawn_cockpit_ui(
                 Personality::Eclipse,
                 "ECLIPSE",
             );
+
+            // ── Stances — the shared body's single standing presence. Only
+            // one is ever visible (see sync_stance_visibility): Solace's stays
+            // under her portrait on the left, Eclipse's under his on the
+            // right, directly beneath the corresponding bubble.
+            for (top_left, image, personality) in [
+                (Vec2::new(180.0, 150.0) * DISPLAY_SCALE + Vec2::new(0.0, PORTRAIT_BUBBLE_SIZE + 30.0), "solace_stance.png", Personality::Solace),
+                (Vec2::new(1292.0, 150.0) * DISPLAY_SCALE + Vec2::new(0.0, PORTRAIT_BUBBLE_SIZE + 30.0), "eclipse_stance.png", Personality::Eclipse),
+            ] {
+                root.spawn((
+                    ImageNode {
+                        image: asset_server.load(image),
+                        texture_atlas: Some(TextureAtlas { layout: stance_layout.clone(), index: 0 }),
+                        ..default()
+                    },
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: Val::Px(top_left.x),
+                        top: Val::Px(top_left.y),
+                        width: Val::Px(STANCE_SIZE),
+                        height: Val::Px(STANCE_SIZE),
+                        ..default()
+                    },
+                    StanceTag(personality),
+                    StanceAnim::default(),
+                ));
+            }
 
             // ── Holograms — right-click an explorer/planet to open, right-click
             // again (or empty space) to close. Left = explorer bag contents,
@@ -2274,6 +2434,27 @@ fn setup(
             speed: 0.02,
             phase: 5.1,
             rot_speed: -0.008,
+        },
+    ));
+
+    // A fourth nebula variant, same treatment as pastel — always present,
+    // independent of personality, placed at a different corner so it doesn't
+    // overlap the pastel one.
+    let pink_base = Vec2::new(-260.0, -140.0) * DISPLAY_SCALE;
+    commands.spawn((
+        Sprite {
+            image: asset_server.load("pink_nebula.png"),
+            color: Color::srgba(1.0, 1.0, 1.0, 0.12),
+            custom_size: Some(Vec2::new(400.0, 300.0) * DISPLAY_SCALE),
+            ..default()
+        },
+        Transform::from_xyz(pink_base.x, pink_base.y, -8.3),
+        DriftBob {
+            base: pink_base,
+            amp: Vec2::new(12.0, 16.0) * DISPLAY_SCALE,
+            speed: 0.025,
+            phase: 1.7,
+            rot_speed: 0.007,
         },
     ));
 
