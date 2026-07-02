@@ -107,58 +107,74 @@ fn main() {
     log::info!("Spawned {} planets", planet_registry.count());
 
     // ── Spawn explorers ─────────────────────────────────────────────────────────
+    // Both explorers are spawned here, mirroring `builder::build_api` (used by
+    // the GUI) — previously only Viviana was created, so the CLI's `bag 2` /
+    // `move 2 ...` etc. would always report "explorer 2 not found" because
+    // Jeb was never spawned in this entry point.
     let (explorer_tx, explorer_rx) =
         unbounded::<bipolar_orchestrator::explorer::handle::ExplorerToOrchestratorMsg>();
 
     let mut explorer_registry = ExplorerRegistry::new();
 
-    let starting_planet = *planet_ids
-        .first()
-        .expect("galaxy must contain at least one planet");
+    // Viviana — id 1, starts on planet 4.
+    {
+        let (tx_to_viv, rx_from_orch) = unbounded::<OrchestratorToExplorer>();
+        let (planet_reply_tx, rx_from_planet) = unbounded::<PlanetToExplorer>();
+        let tx_planet = planet_registry
+            .get(4)
+            .expect("planet 4 not spawned")
+            .explorer_sender();
 
-    let starting_planet_sender = {
-        let planet = planet_registry
-            .get(starting_planet)
-            .expect("starting planet must have been spawned");
+        let mut viv = explorer_astronaut::create_explorer(
+            1,
+            rx_from_orch,
+            explorer_tx.clone(),
+            rx_from_planet,
+            tx_planet,
+            4,
+        )
+        .expect("failed to create Viviana");
 
-        planet.explorer_sender()
-    };
+        let thread = std::thread::Builder::new()
+            .name("explorer-viviana".into())
+            .spawn(move || viv.run())
+            .expect("failed to spawn Viviana thread");
 
-    // Orchestrator -> Explorer channel
-    let (tx_to_explorer, rx_from_orchestrator) = unbounded::<OrchestratorToExplorer>();
+        explorer_registry.insert(ExplorerHandle::new(1, tx_to_viv, planet_reply_tx, 4, thread));
+        log::info!("Spawned explorer 1 (Viviana) on planet 4");
+    }
 
-    // Planet -> Explorer channel.
-    // This sender is stored in ExplorerHandle and given to planets when the explorer moves.
-    let (planet_reply_tx, rx_from_planet) = unbounded::<PlanetToExplorer>();
+    // Jeb — id 2, starts on planet 1.
+    {
+        let (tx_to_jeb, rx_from_orch) = unbounded::<OrchestratorToExplorer>();
+        let (planet_reply_tx, rx_from_planet) = unbounded::<PlanetToExplorer>();
+        let tx_planet = planet_registry
+            .get(1)
+            .expect("planet 1 not spawned")
+            .explorer_sender();
 
-    let explorer_id = 1;
+        let jeb = explorer_jebediah::create_explorer(
+            2,
+            rx_from_orch,
+            explorer_tx.clone(),
+            rx_from_planet,
+            tx_planet,
+            1,
+        )
+        .expect("failed to create Jeb");
 
-    let mut explorer = explorer_astronaut::create_explorer(
-        explorer_id,
-        rx_from_orchestrator,
-        explorer_tx.clone(),
-        rx_from_planet,
-        starting_planet_sender,
-        starting_planet,
-    )
-        .expect("failed to create explorer_astronaut");
+        let thread = std::thread::Builder::new()
+            .name("explorer-jeb".into())
+            .spawn(move || {
+                if let Err(e) = jeb.run() {
+                    log::error!("Jeb explorer thread exited with error: {e}");
+                }
+            })
+            .expect("failed to spawn Jeb thread");
 
-    let explorer_thread = std::thread::Builder::new()
-        .name(format!("explorer-{explorer_id}"))
-        .spawn(move || {
-            explorer.run();
-        })
-        .expect("failed to spawn explorer thread");
-
-    explorer_registry.insert(ExplorerHandle::new(
-        explorer_id,
-        tx_to_explorer,
-        planet_reply_tx,
-        starting_planet,
-        explorer_thread,
-    ));
-
-    log::info!("Spawned explorer {explorer_id} on planet {starting_planet}");
+        explorer_registry.insert(ExplorerHandle::new(2, tx_to_jeb, planet_reply_tx, 1, thread));
+        log::info!("Spawned explorer 2 (Jeb) on planet 1");
+    }
 
     // ── Build probability registry and forge ────────────────────────────────────
     let mut rng = rand::rng();
