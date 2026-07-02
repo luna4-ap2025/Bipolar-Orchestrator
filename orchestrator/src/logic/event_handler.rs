@@ -29,7 +29,7 @@ pub type BagContent = crate::explorer::handle::BagContent;
 
 /// Drains all pending `ExplorerToOrchestrator` messages without blocking.
 ///
-/// Called once per logic tick so explorers are not left waiting indefinitely.
+/// Called frequently by the logic loop so explorers are not left waiting.
 pub fn drain_explorer_messages(
     explorer_rx: &Receiver<ExplorerToOrchestrator<BagContent>>,
     planet_rx: &Receiver<PlanetToOrchestrator>,
@@ -42,7 +42,6 @@ pub fn drain_explorer_messages(
             Ok(msg) => {
                 handle_one(
                     msg,
-                    explorer_rx,
                     planet_rx,
                     topology,
                     planets,
@@ -63,7 +62,6 @@ pub fn drain_explorer_messages(
 /// Dispatches a single explorer message to the appropriate handler.
 fn handle_one(
     msg: ExplorerToOrchestrator<BagContent>,
-    explorer_rx: &Receiver<ExplorerToOrchestrator<BagContent>>,
     planet_rx: &Receiver<PlanetToOrchestrator>,
     topology: &Arc<Mutex<Topology>>,
     planets: &Arc<Mutex<PlanetRegistry>>,
@@ -78,21 +76,66 @@ fn handle_one(
                 "Explorer {explorer_id} requests neighbors of planet {current_planet_id}"
             );
 
-            let neighbors = topology
-                .lock()
-                .unwrap()
-                .neighbors(current_planet_id);
+            // We still check that the explorer exists.
+            // But IMPORTANT:
+            // NeighborsResponse does not contain the planet id it refers to.
+            // Therefore, if the request says "planet 5", we must answer with
+            // neighbors of planet 5, not with the registry's current planet.
+            let real_current_planet = {
+                let Ok(registry) = explorers.lock() else {
+                    log::warn!(
+                        "Could not lock explorer registry while handling NeighborsRequest from explorer {explorer_id}"
+                    );
+                    return;
+                };
+
+                let Some(handle) = registry.get(explorer_id) else {
+                    log::warn!(
+                        "Ignoring NeighborsRequest from unknown explorer {explorer_id}"
+                    );
+                    return;
+                };
+
+                handle.current_planet()
+            };
+
+            if real_current_planet != current_planet_id {
+                log::warn!(
+                    "NeighborsRequest from explorer {explorer_id} used planet {current_planet_id}, while registry says {real_current_planet}. Responding with requested planet to keep explorer mapping consistent."
+                );
+            }
+
+            let neighbors = {
+                let Ok(topo) = topology.lock() else {
+                    log::warn!(
+                        "Could not lock topology while handling NeighborsRequest from explorer {explorer_id}"
+                    );
+                    return;
+                };
+
+                topo.neighbors(current_planet_id)
+                    .into_iter()
+                    .filter(|neighbor_id| *neighbor_id != current_planet_id)
+                    .collect::<Vec<_>>()
+            };
 
             let Ok(explorer_registry) = explorers.lock() else {
+                log::warn!(
+                    "Could not lock explorer registry to send NeighborsResponse to explorer {explorer_id}"
+                );
                 return;
             };
 
             if let Some(handle) = explorer_registry.get(explorer_id) {
-                let _ = handle.send(
+                if let Err(e) = handle.send(
                     OrchestratorToExplorer::NeighborsResponse {
                         neighbors,
                     },
-                );
+                ) {
+                    log::error!(
+                        "Failed sending NeighborsResponse to explorer {explorer_id}: {e}"
+                    );
+                }
             }
         }
 
@@ -105,6 +148,41 @@ fn handle_one(
                 "Explorer {explorer_id} requests travel {current_planet_id} → {dst_planet_id}"
             );
 
+            let real_current_planet = {
+                let Ok(registry) = explorers.lock() else {
+                    log::warn!(
+                        "Could not lock explorer registry while handling TravelToPlanetRequest from explorer {explorer_id}"
+                    );
+                    return;
+                };
+
+                let Some(handle) = registry.get(explorer_id) else {
+                    log::warn!(
+                        "Ignoring TravelToPlanetRequest from unknown explorer {explorer_id}"
+                    );
+                    return;
+                };
+
+                handle.current_planet()
+            };
+
+            // For travel requests, unlike NeighborsRequest, the registry must win.
+            // If the explorer is asking to travel from a planet that the registry
+            // does not consider current anymore, the request is stale and unsafe.
+            if real_current_planet != current_planet_id {
+                log::warn!(
+                    "Ignoring stale TravelToPlanetRequest from explorer {explorer_id}: requested from {current_planet_id}, but registry says {real_current_planet}"
+                );
+                return;
+            }
+
+            if dst_planet_id == current_planet_id {
+                log::warn!(
+                    "Ignoring TravelToPlanetRequest from explorer {explorer_id}: destination equals current planet {current_planet_id}"
+                );
+                return;
+            }
+
             if let Err(e) = routing::move_explorer::execute(
                 explorer_id,
                 current_planet_id,
@@ -113,7 +191,6 @@ fn handle_one(
                 planets,
                 explorers,
                 planet_rx,
-                explorer_rx,
             ) {
                 log::error!(
                     "Failed to move explorer {explorer_id} from {current_planet_id} to {dst_planet_id}: {e}"
@@ -127,6 +204,10 @@ fn handle_one(
 
         ExplorerToOrchestrator::StopExplorerAIResult { explorer_id } => {
             log::info!("Explorer {explorer_id} AI stopped");
+        }
+
+        ExplorerToOrchestrator::ResetExplorerAIResult { explorer_id } => {
+            log::info!("Explorer {explorer_id} AI reset");
         }
 
         ExplorerToOrchestrator::KillExplorerResult { explorer_id } => {
@@ -147,6 +228,68 @@ fn handle_one(
                 "Explorer {explorer_id} confirmed arrival at planet {planet_id}"
             );
 
+            // Optional safety check: only accept the reported planet if it still
+            // exists in topology. This avoids updating the registry to a planet
+            // that was destroyed meanwhile.
+            let planet_still_exists = {
+                let Ok(topo) = topology.lock() else {
+                    log::warn!(
+                        "Could not lock topology while handling MovedToPlanetResult from explorer {explorer_id}"
+                    );
+                    return;
+                };
+
+                topo.planet_ids().any(|id| id == planet_id)
+            };
+
+            if !planet_still_exists {
+                log::warn!(
+                    "Ignoring MovedToPlanetResult from explorer {explorer_id}: planet {planet_id} no longer exists"
+                );
+                return;
+            }
+
+            if let Ok(mut registry) = explorers.lock() {
+                if let Some(handle) = registry.get_mut(explorer_id) {
+                    handle.set_current_planet(planet_id);
+
+                    log::info!(
+                        "Explorer {explorer_id} registry position updated to planet {planet_id}"
+                    );
+                } else {
+                    log::warn!(
+                        "Received MovedToPlanetResult from unknown explorer {explorer_id}"
+                    );
+                }
+            }
+        }
+
+        ExplorerToOrchestrator::CurrentPlanetResult {
+            explorer_id,
+            planet_id,
+        } => {
+            log::debug!(
+                "Explorer {explorer_id} reports current planet {planet_id}"
+            );
+
+            let planet_still_exists = {
+                let Ok(topo) = topology.lock() else {
+                    log::warn!(
+                        "Could not lock topology while handling CurrentPlanetResult from explorer {explorer_id}"
+                    );
+                    return;
+                };
+
+                topo.planet_ids().any(|id| id == planet_id)
+            };
+
+            if !planet_still_exists {
+                log::warn!(
+                    "Ignoring CurrentPlanetResult from explorer {explorer_id}: planet {planet_id} no longer exists"
+                );
+                return;
+            }
+
             if let Ok(mut registry) = explorers.lock() {
                 if let Some(handle) = registry.get_mut(explorer_id) {
                     handle.set_current_planet(planet_id);
@@ -154,8 +297,49 @@ fn handle_one(
             }
         }
 
-        other => {
-            log::debug!("Logic loop ignoring non-autonomous message: {other:?}");
+        ExplorerToOrchestrator::GenerateResourceResponse {
+            explorer_id,
+            generated,
+        } => {
+            log::debug!(
+                "Explorer {explorer_id} generated resource result: {generated:?}"
+            );
+        }
+
+        ExplorerToOrchestrator::CombineResourceResponse {
+            explorer_id,
+            generated,
+        } => {
+            log::debug!(
+                "Explorer {explorer_id} combined resource result: {generated:?}"
+            );
+        }
+
+        ExplorerToOrchestrator::SupportedResourceResult {
+            explorer_id,
+            supported_resources,
+        } => {
+            log::debug!(
+                "Explorer {explorer_id} supported resources: {supported_resources:?}"
+            );
+        }
+
+        ExplorerToOrchestrator::SupportedCombinationResult {
+            explorer_id,
+            combination_list,
+        } => {
+            log::debug!(
+                "Explorer {explorer_id} supported combinations: {combination_list:?}"
+            );
+        }
+
+        ExplorerToOrchestrator::BagContentResponse {
+            explorer_id,
+            bag_content,
+        } => {
+            log::debug!(
+                "Explorer {explorer_id} bag content: {bag_content:?}"
+            );
         }
     }
 }

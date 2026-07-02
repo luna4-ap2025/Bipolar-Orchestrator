@@ -1,40 +1,54 @@
 //! # Explorer move protocol
 //!
-//! Implements the full three-step move sequence described in the project spec
+//! Implements the planet-side move sequence described in the project spec
 //! and in `MESSAGE_DIAGRAMS.md` ("Moving to another planet").
 //!
 //! ## Steps
 //! 1. `OutgoingExplorerRequest` → current planet → wait for `OutgoingExplorerResponse`.
-//! 2. `IncomingExplorerRequest` → destination planet (with the explorer's dedicated
-//!    `Sender<PlanetToExplorer>`) → wait for `IncomingExplorerResponse`.
-//! 3. `MoveToPlanet` → explorer (with the destination planet's `ExplorerToPlanet` sender)
-//!    → wait for `MovedToPlanetResult`.
+//! 2. `IncomingExplorerRequest` → destination planet, passing the explorer's
+//!    dedicated `Sender<PlanetToExplorer>` → wait for `IncomingExplorerResponse`.
+//! 3. `MoveToPlanet` → explorer, passing the destination planet's
+//!    `ExplorerToPlanet` sender.
 //!
-//! ## Owner: Vale
+//! Important design note:
+//! With one shared `ExplorerToOrchestrator` channel, this file must NOT wait
+//! directly for `MovedToPlanetResult`, because another explorer's autonomous
+//! message may arrive first. `MovedToPlanetResult` is handled later by
+//! `logic::event_handler`, using `explorer_id`.
 
+use crate::ack::recv_ack;
 use crate::error::OrchestratorError;
 use crate::explorer::ExplorerRegistry;
 use crate::galaxy::Topology;
 use crate::planet::PlanetRegistry;
+
 use common_game::protocols::orchestrator_explorer::OrchestratorToExplorer;
-use common_game::protocols::orchestrator_planet::{OrchestratorToPlanet, PlanetToOrchestrator};
+use common_game::protocols::orchestrator_planet::{
+    OrchestratorToPlanet,
+    PlanetToOrchestrator,
+};
 use common_game::utils::ID;
+
 use crossbeam_channel::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const MOVE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Executes the three-step explorer move protocol synchronously.
+/// Executes the planet-side move protocol.
 ///
-/// Returns `Ok(())` when the orchestrator has sent `MoveToPlanet` to the explorer
-/// and received `MovedToPlanetResult` back.
+/// This function validates the move, tells the current planet that the explorer
+/// is leaving, tells the destination planet that the explorer is arriving, and
+/// finally sends `MoveToPlanet` to the explorer.
+///
+/// It does NOT wait for `MovedToPlanetResult`.
+/// That message is processed asynchronously by `logic::event_handler`.
 ///
 /// # Errors
 /// - [`OrchestratorError::NotANeighbor`] if `dst` is not adjacent to `current`.
-/// - [`OrchestratorError::PlanetNotFound`] if either planet doesn't exist.
-/// - [`OrchestratorError::ExplorerNotFound`] if the explorer doesn't exist.
-/// - [`OrchestratorError::ChannelError`] if any step times out or disconnects.
+/// - [`OrchestratorError::PlanetNotFound`] if either planet does not exist.
+/// - [`OrchestratorError::ExplorerNotFound`] if the explorer does not exist.
+/// - [`OrchestratorError::ChannelError`] if any planet ack times out or a send fails.
 pub fn execute(
     explorer_id: ID,
     current_planet_id: ID,
@@ -43,11 +57,11 @@ pub fn execute(
     planets: &Arc<Mutex<PlanetRegistry>>,
     explorers: &Arc<Mutex<ExplorerRegistry>>,
     planet_ack_rx: &Receiver<PlanetToOrchestrator>,
-    explorer_ack_rx: &Receiver<crate::explorer::handle::ExplorerToOrchestratorMsg>,
 ) -> Result<(), OrchestratorError> {
     // Validate the move is topologically legal.
     {
         let topo = topology.lock().unwrap();
+
         if !topo.are_neighbors(current_planet_id, dst_planet_id) {
             return Err(OrchestratorError::NotANeighbor {
                 from: current_planet_id,
@@ -57,24 +71,25 @@ pub fn execute(
     }
 
     // ── Step 1 ────────────────────────────────────────────────────────────────
-    // Tell the CURRENT planet the explorer is leaving.
-    // The planet drops the explorer's Sender<PlanetToExplorer> from its map.
+    // Tell the CURRENT planet that the explorer is leaving.
     {
         let planets = planets.lock().unwrap();
+
         let current = planets
             .get(current_planet_id)
             .ok_or(OrchestratorError::PlanetNotFound(current_planet_id))?;
+
         current
             .send(OrchestratorToPlanet::OutgoingExplorerRequest { explorer_id })
             .map_err(OrchestratorError::ChannelError)?;
     }
-    wait_for_outgoing_ack(planet_ack_rx, current_planet_id)?;
+
+    wait_for_outgoing_ack(planet_ack_rx, current_planet_id, explorer_id)?;
 
     // ── Step 2 ────────────────────────────────────────────────────────────────
-    // Tell the DESTINATION planet the explorer is arriving.
-    // We pass the explorer's dedicated Sender<PlanetToExplorer> so the planet
-    // can reply directly to this explorer (the explorer's rx_planet never changes).
-    //
+    // Tell the DESTINATION planet that the explorer is arriving.
+    // We pass the explorer's dedicated Sender<PlanetToExplorer>, so the planet
+    // can reply directly to that explorer.
     let planet_reply_tx = {
         let explorers = explorers.lock().unwrap();
 
@@ -87,51 +102,52 @@ pub fn execute(
 
     {
         let planets = planets.lock().unwrap();
+
         let dst = planets
             .get(dst_planet_id)
             .ok_or(OrchestratorError::PlanetNotFound(dst_planet_id))?;
+
         dst.send(OrchestratorToPlanet::IncomingExplorerRequest {
             explorer_id,
             new_sender: planet_reply_tx,
         })
-        .map_err(OrchestratorError::ChannelError)?;
+            .map_err(OrchestratorError::ChannelError)?;
     }
-    wait_for_incoming_ack(planet_ack_rx, dst_planet_id)?;
+
+    wait_for_incoming_ack(planet_ack_rx, dst_planet_id, explorer_id)?;
 
     // ── Step 3 ────────────────────────────────────────────────────────────────
     // Tell the EXPLORER to switch to the new planet.
-    // We give it the destination planet's ExplorerToPlanet sender so it can
-    // write to the new planet (the explorer replaces its tx_planet with this).
+    // We give it the destination planet's ExplorerToPlanet sender.
     let dst_explorer_tx = {
         let planets = planets.lock().unwrap();
+
         let dst = planets
             .get(dst_planet_id)
             .ok_or(OrchestratorError::PlanetNotFound(dst_planet_id))?;
+
         dst.explorer_sender()
     };
 
     {
         let explorers = explorers.lock().unwrap();
-        let expl = explorers
+
+        let explorer = explorers
             .get(explorer_id)
             .ok_or(OrchestratorError::ExplorerNotFound(explorer_id))?;
-        expl.send(OrchestratorToExplorer::MoveToPlanet {
-            sender_to_new_planet: Some(dst_explorer_tx),
-            planet_id: dst_planet_id,
-        })
-        .map_err(OrchestratorError::ChannelError)?;
-    }
-    wait_for_move_ack(explorer_ack_rx, explorer_id)?;
 
-    // Update the orchestrator's record of the explorer's location.
-    {
-        let mut explorers = explorers.lock().unwrap();
-        if let Some(h) = explorers.get_mut(explorer_id) {
-            h.set_current_planet(dst_planet_id);
-        }
+        explorer
+            .send(OrchestratorToExplorer::MoveToPlanet {
+                sender_to_new_planet: Some(dst_explorer_tx),
+                planet_id: dst_planet_id,
+            })
+            .map_err(OrchestratorError::ChannelError)?;
     }
 
-    log::info!("Explorer {explorer_id} moved {current_planet_id} → {dst_planet_id}");
+    log::info!(
+        "MoveToPlanet sent to explorer {explorer_id}: {current_planet_id} → {dst_planet_id}"
+    );
+
     Ok(())
 }
 
@@ -140,58 +156,65 @@ pub fn execute(
 fn wait_for_outgoing_ack(
     rx: &Receiver<PlanetToOrchestrator>,
     planet_id: ID,
+    explorer_id: ID,
 ) -> Result<(), OrchestratorError> {
-    match rx.recv_timeout(MOVE_TIMEOUT) {
-        Ok(PlanetToOrchestrator::OutgoingExplorerResponse { res, .. }) => {
-            res.map_err(OrchestratorError::ChannelError)
-        }
-        Ok(other) => Err(OrchestratorError::ChannelError(format!(
-            "Expected OutgoingExplorerResponse, got {other:?}"
-        ))),
-        Err(_) => Err(OrchestratorError::ChannelError(format!(
-            "Timeout waiting for OutgoingExplorerResponse from planet {planet_id}"
-        ))),
-    }
+    recv_ack(
+        rx,
+        MOVE_TIMEOUT,
+        &format!("OutgoingExplorerResponse from planet {planet_id} for explorer {explorer_id}"),
+        |msg| match msg {
+            PlanetToOrchestrator::OutgoingExplorerResponse { res, .. } => {
+                match res {
+                    Ok(()) => Ok(()),
+                    Err(err) => Err(PlanetToOrchestrator::OutgoingExplorerResponse {
+                        res: Err(err),
+                        planet_id,
+                        explorer_id,
+                    }),
+                }
+            }
+
+            other => Err(other),
+        },
+    )
+        .map_err(|err| match err {
+            OrchestratorError::ChannelError(message) => {
+                OrchestratorError::ChannelError(message)
+            }
+            other => other,
+        })
 }
 
 fn wait_for_incoming_ack(
     rx: &Receiver<PlanetToOrchestrator>,
     planet_id: ID,
-) -> Result<(), OrchestratorError> {
-    match rx.recv_timeout(MOVE_TIMEOUT) {
-        Ok(PlanetToOrchestrator::IncomingExplorerResponse { res, .. }) => {
-            res.map_err(OrchestratorError::ChannelError)
-        }
-        Ok(other) => Err(OrchestratorError::ChannelError(format!(
-            "Expected IncomingExplorerResponse, got {other:?}"
-        ))),
-        Err(_) => Err(OrchestratorError::ChannelError(format!(
-            "Timeout waiting for IncomingExplorerResponse from planet {planet_id}"
-        ))),
-    }
-}
-
-/// Waits for the explorer to confirm it has switched to the new planet.
-fn wait_for_move_ack(
-    rx: &Receiver<crate::explorer::handle::ExplorerToOrchestratorMsg>,
     explorer_id: ID,
 ) -> Result<(), OrchestratorError> {
-    use common_game::protocols::orchestrator_explorer::ExplorerToOrchestrator;
-    match rx.recv_timeout(MOVE_TIMEOUT) {
-        Ok(ExplorerToOrchestrator::MovedToPlanetResult {
-            explorer_id: eid,
-            planet_id,
-        }) if eid == explorer_id => {
-            log::debug!("Explorer {explorer_id} confirmed arrival at planet {planet_id}");
-            Ok(())
-        }
-        Ok(other) => Err(OrchestratorError::ChannelError(format!(
-            "Expected MovedToPlanetResult for explorer {explorer_id}, got {other:?}"
-        ))),
-        Err(_) => Err(OrchestratorError::ChannelError(format!(
-            "Timeout waiting for MovedToPlanetResult from explorer {explorer_id}"
-        ))),
-    }
+    recv_ack(
+        rx,
+        MOVE_TIMEOUT,
+        &format!("IncomingExplorerResponse from planet {planet_id} for explorer {explorer_id}"),
+        |msg| match msg {
+            PlanetToOrchestrator::IncomingExplorerResponse { res, .. } => {
+                match res {
+                    Ok(()) => Ok(()),
+                    Err(err) => Err(PlanetToOrchestrator::IncomingExplorerResponse {
+                        res: Err(err),
+                        planet_id,
+                        explorer_id,
+                    }),
+                }
+            }
+
+            other => Err(other),
+        },
+    )
+        .map_err(|err| match err {
+            OrchestratorError::ChannelError(message) => {
+                OrchestratorError::ChannelError(message)
+            }
+            other => other,
+        })
 }
 
 #[cfg(test)]
@@ -200,29 +223,30 @@ mod tests {
 
     #[test]
     fn not_a_neighbor_is_rejected() {
-        // Build topology via the public parser: 1↔2, 3 is isolated
         let topo = Arc::new(Mutex::new(
             crate::galaxy::parser::parse_str("1 2\n2 1\n3\n").unwrap(),
         ));
+
         let planets = Arc::new(Mutex::new(PlanetRegistry::new()));
         let explorers = Arc::new(Mutex::new(ExplorerRegistry::new()));
 
         let (_planet_tx, planet_rx) = crossbeam_channel::unbounded();
-        let (_expl_tx, expl_rx) = crossbeam_channel::unbounded::<crate::explorer::handle::ExplorerToOrchestratorMsg>();
 
         let result = execute(
-            42,   // explorer_id
-            1,    // current_planet_id
-            3,    // dst_planet_id — NOT a neighbor of 1
+            42, // explorer_id
+            1,  // current_planet_id
+            3,  // dst_planet_id — NOT a neighbor of 1
             &topo,
             &planets,
             &explorers,
             &planet_rx,
-            &expl_rx,
         );
 
         assert!(
-            matches!(result, Err(OrchestratorError::NotANeighbor { from: 1, to: 3 })),
+            matches!(
+                result,
+                Err(OrchestratorError::NotANeighbor { from: 1, to: 3 })
+            ),
             "expected NotANeighbor error, got {result:?}"
         );
     }
