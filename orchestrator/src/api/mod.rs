@@ -395,7 +395,6 @@ impl OrchestratorApi {
             &self.planets,
             &self.explorers,
             &planet_rx,
-            &explorer_rx,
         )
     }
 

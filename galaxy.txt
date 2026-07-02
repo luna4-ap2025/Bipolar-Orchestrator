@@ -4,7 +4,6 @@
 # Planet IDs must be unique unsigned integers.
 #
 # Example topology: a ring of 7 planets with some cross-links
-# (replace planet names/ids with actual ones after integrating external repos)
 1 2 7
 2 1 3
 3 2 4
