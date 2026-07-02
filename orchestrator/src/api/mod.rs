@@ -257,6 +257,15 @@ impl OrchestratorApi {
                 .send(OrchestratorToPlanet::Sunray(sunray))
                 .map_err(OrchestratorError::ChannelError)?;
         }
+        // Record the same events `dispatch_to_planet` records for an
+        // autonomous sunray — without this, manual sunrays were invisible to
+        // the GUI's whole portrait-reaction system (which only reads
+        // `GalaxyEvent`s from the snapshot), so only the client-side-only
+        // glitch flash ever showed for a manual action.
+        self.prob_registry
+            .lock()
+            .unwrap()
+            .record_event(crate::probability::OrchestratorEvent::SunraySent { planet_id });
 
         let rx = self.planet_rx.lock().unwrap();
         let result = recv_ack(
@@ -271,6 +280,10 @@ impl OrchestratorApi {
         .inspect(|()| log::info!("Manual sunray: SunrayAck from planet {planet_id}"));
 
         if result.is_ok() {
+            self.prob_registry
+                .lock()
+                .unwrap()
+                .record_event(crate::probability::OrchestratorEvent::SunrayReceived { planet_id });
             // "Infiltrating the orchestrator's mind" — a manual sunray nudges
             // the whole galaxy's mood back toward calm, not just this planet.
             self.prob_registry
@@ -301,6 +314,12 @@ impl OrchestratorApi {
                 .send(OrchestratorToPlanet::Asteroid(asteroid))
                 .map_err(OrchestratorError::ChannelError)?;
         }
+        // See `send_sunray` — without this, manual asteroids never showed
+        // Solace's "unwanted_event" (guilty) reaction, only the glitch flash.
+        self.prob_registry
+            .lock()
+            .unwrap()
+            .record_event(crate::probability::OrchestratorEvent::AsteroidSent { planet_id });
 
         let rocket = {
             let rx = self.planet_rx.lock().unwrap();
@@ -324,18 +343,20 @@ impl OrchestratorApi {
             let mut topo = self.topology.lock().unwrap();
             let mut prob = self.prob_registry.lock().unwrap();
             let mut explorers = self.explorers.lock().unwrap();
-            let explorer_rx = self.explorer_rx.lock().unwrap();
             crate::logic::tick::destroy_planet(
                 planet_id,
                 &mut planets,
                 &mut topo,
                 &mut prob,
                 &mut explorers,
-                &explorer_rx,
                 &mut rand::rng(),
             )?;
-            // on_planet_death already reset hostility to 0 above; no extra nudge needed.
+            // destroy_planet already dampened hostility above; no extra nudge needed.
         } else {
+            self.prob_registry
+                .lock()
+                .unwrap()
+                .record_event(crate::probability::OrchestratorEvent::AsteroidDeflected { planet_id });
             // "Infiltrating the orchestrator's mind" — a manual asteroid nudges
             // the whole galaxy's mood toward hostility, not just this planet.
             self.prob_registry
@@ -503,6 +524,14 @@ impl OrchestratorApi {
     /// Returns the IDs of all currently alive planets.
     pub fn alive_planets(&self) -> Vec<ID> {
         self.topology.lock().unwrap().planet_ids().collect()
+    }
+
+    /// Debug-only: directly nudges hostility by `delta` (clamped to
+    /// `[0.0, 1.0]`), bypassing the normal sunray/asteroid-driven climb.
+    /// Lets the GUI verify the Eclipse/Solace flip instantly instead of
+    /// waiting through many real death cycles.
+    pub fn debug_nudge_hostility(&self, delta: f64) {
+        self.prob_registry.lock().unwrap().nudge_hostility(delta);
     }
 
     /// Gracefully shuts down all threads: stops logic, kills all planets and explorers.

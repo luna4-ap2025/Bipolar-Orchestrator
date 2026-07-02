@@ -22,6 +22,14 @@ enum UiCommand {
     Asteroid(u32),
     MoveExplorer { explorer_id: u32, dst: u32 },
     ToggleLogic,
+    /// Fetches an explorer's bag content on demand (right-click) — not part of
+    /// the regular snapshot since it requires a channel round-trip.
+    InspectExplorer(u32),
+    /// Fetches a planet's energy cell / rocket state on demand (right-click).
+    InspectPlanet(u32),
+    /// Debug-only: forces hostility toward Eclipse (E key) or Solace (S key)
+    /// instantly, to verify the flip without waiting through real playtime.
+    DebugNudgeHostility(f64),
 }
 
 #[derive(Resource, Clone)]
@@ -78,6 +86,11 @@ struct ReadySignal(Option<CmdSender<()>>);
 
 const SOLACE_GOLD: Color = Color::srgb(1.0, 0.85, 0.35);
 const ECLIPSE_PURPLE: Color = Color::srgb(0.65, 0.45, 0.95);
+
+/// Pixeloid font family — regular weight, used for all cockpit UI text.
+/// `PixeloidSans-Bold.ttf` and `PixeloidMono.ttf` are also delivered in
+/// `assets/fonts/Pixeloid_Font_1_0/` for future emphasis/mono use, not yet wired.
+const FONT_REGULAR: &str = "fonts/Pixeloid_Font_1_0/PixeloidSans.ttf";
 
 /// All measurements below (`cockpit.png` layer positions, ring layout,
 /// viewport bounds, etc.) were taken at a 1600x900 reference design. The
@@ -211,6 +224,48 @@ struct AsteroidButtonTag;
 #[derive(Component)]
 struct ChronicleScreenText;
 
+// ── Entity inspection (holograms) ───────────────────────────────────────────
+//
+// Right-click a planet or explorer to open its hologram. `Inspecting` is the
+// client-side toggle (which hologram should be visible, and for which id);
+// `Inspection` is the async result of the on-demand data fetch the bridge
+// thread performs (bag content / planet state both require a channel
+// round-trip, so they're fetched once on click rather than every snapshot).
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InspectTarget {
+    Explorer(u32),
+    Planet(u32),
+}
+
+#[derive(Resource, Default)]
+struct Inspecting(Option<InspectTarget>);
+
+#[derive(Clone, Default)]
+enum InspectionData {
+    #[default]
+    None,
+    ExplorerBag { id: u32, bag_lines: Vec<String> },
+    PlanetInfo { id: u32, energy_cells: usize, charged_cells: usize, has_rocket: bool },
+}
+
+#[derive(Resource, Clone)]
+struct Inspection(Arc<Mutex<InspectionData>>);
+
+/// Marks the left hologram panel (shows explorer bag contents).
+#[derive(Component)]
+struct ExplorerHologram;
+
+/// Marks the right hologram panel (shows planet state).
+#[derive(Component)]
+struct PlanetHologram;
+
+#[derive(Component)]
+struct ExplorerHologramText;
+
+#[derive(Component)]
+struct PlanetHologramText;
+
 fn format_mmss(seconds: f64) -> String {
     let total = seconds.max(0.0) as u64;
     format!("{:02}:{:02}", total / 60, total % 60)
@@ -220,6 +275,55 @@ fn format_mmss(seconds: f64) -> String {
 
 const GALAXY_SRC: &str = include_str!("../../galaxy.txt");
 const PLANETS_SRC: &str = include_str!("../../planets.toml");
+
+/// Planet id -> display name, parsed once from `planets.toml` client-side
+/// (the same file the bridge thread's `build_api` reads) so the GUI never
+/// has to round-trip to the orchestrator just to know who owns a planet.
+#[derive(Resource)]
+struct PlanetNames(HashMap<u32, &'static str>);
+
+impl PlanetNames {
+    fn load() -> Self {
+        let factories = bipolar_orchestrator::galaxy::planet_config::parse_str(PLANETS_SRC)
+            .expect("planets.toml should already be valid — build_api parses the same file");
+        Self(
+            factories
+                .into_iter()
+                .map(|(id, factory)| (id, display_name(&factory)))
+                .collect(),
+        )
+    }
+
+    fn get(&self, planet_id: u32) -> &'static str {
+        self.0.get(&planet_id).copied().unwrap_or("Unknown")
+    }
+}
+
+/// Explorer id -> character name. Fixed at spawn time everywhere the
+/// explorers are created (`builder.rs`, `main.rs`): Viviana is always 1,
+/// Jebediah always 2.
+fn explorer_display_name(id: u32) -> &'static str {
+    match id {
+        1 => "Viviana",
+        2 => "Jebediah",
+        _ => "Unknown Explorer",
+    }
+}
+
+/// Maps a factory crate name (from `planets.toml`) to the team's display
+/// name, per the professor's "PLANETS REPO'S" list.
+fn display_name(factory: &str) -> &'static str {
+    match factory {
+        "orbitron" => "Orbitron",
+        "skycartel" => "SkyCartel",
+        "rustrelli" => "Rustrelli",
+        "thecompilerstrikesback" => "The Compiler Strikes Back",
+        "crabtorio" => "Crabtorio",
+        "houstonwehaveaborrow" => "Houston We Have A Borrow",
+        "enterprise" => "Enterprise",
+        _ => "Unknown",
+    }
+}
 
 // ── Bevy resources ─────────────────────────────────────────────────────────────
 
@@ -236,6 +340,9 @@ struct LiveSnapshot(Arc<Mutex<Option<GalaxySnapshot>>>);
 struct GalaxyState {
     alive: HashSet<u32>,
     explorer_planet: HashMap<u32, u32>,
+    /// Real, live adjacency from the backend topology — replaces the old
+    /// hardcoded ring, which never reflected planets dying.
+    neighbors: HashMap<u32, Vec<u32>>,
     personality: Personality,
     /// Global hostility in `[0.0, 1.0]`; drives the Solace/Eclipse crossfade.
     hostility: f64,
@@ -261,7 +368,7 @@ struct GlitchOverlay {
     remaining: f32,
 }
 
-const GLITCH_DURATION_SECS: f32 = 0.35;
+const GLITCH_DURATION_SECS: f32 = 1.2;
 
 // ── ECS components ─────────────────────────────────────────────────────────────
 
@@ -552,30 +659,14 @@ fn smoothstep(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// Neighbors of `planet_id` according to the hardcoded ring in [`CONNECTIONS`].
-/// Mirrors the topology in `galaxy.txt` (a plain 7-planet ring), which is also
-/// what the visual layout assumes.
-fn neighbors_of(planet_id: u32) -> Vec<u32> {
-    let idx = planet_id.saturating_sub(1) as usize;
-    CONNECTIONS
-        .iter()
-        .filter_map(|&(a, b)| {
-            if a == idx {
-                Some((b + 1) as u32)
-            } else if b == idx {
-                Some((a + 1) as u32)
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
     let snapshot: Arc<Mutex<Option<GalaxySnapshot>>> = Arc::new(Mutex::new(None));
     let snap_write = Arc::clone(&snapshot);
+
+    let inspection = Inspection(Arc::new(Mutex::new(InspectionData::None)));
+    let inspection_write = inspection.clone();
 
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<UiCommand>();
     let (ready_tx, ready_rx) = crossbeam_channel::bounded::<()>(1);
@@ -597,7 +688,7 @@ fn main() {
             // Drain manual commands from the GUI before sleeping. These share the
             // same orchestrator channels as the autonomous logic loop — the same
             // way the CLI's `interactive_loop` does when logic is running.
-            drain_ui_commands(&cmd_rx, &mut api, &mut logic_running);
+            drain_ui_commands(&cmd_rx, &mut api, &mut logic_running, &inspection_write);
 
             std::thread::sleep(Duration::from_millis(250));
             let s = bipolar_orchestrator::snapshot::build(&api);
@@ -645,6 +736,9 @@ fn main() {
         .insert_resource(PlanetReactionQueue::default())
         .insert_resource(UiCommands(cmd_tx))
         .insert_resource(Selection::default())
+        .insert_resource(Inspecting::default())
+        .insert_resource(inspection)
+        .insert_resource(PlanetNames::load())
         .insert_resource(LogicRunState::NotStarted)
         .insert_resource(ShootingStarTimer::default())
         .insert_resource(GlitchQueue::default())
@@ -675,6 +769,7 @@ fn main() {
                 cockpit_button_hover,
             ),
         )
+        .add_systems(Update, (sync_hologram_visibility, sync_hologram_content, sync_explorers, sync_action_buttons_enabled, sync_selection_validity))
         .add_systems(
             Update,
             (
@@ -697,6 +792,7 @@ fn drain_ui_commands(
     cmd_rx: &CmdReceiver<UiCommand>,
     api: &mut bipolar_orchestrator::api::OrchestratorApi,
     logic_running: &mut bool,
+    inspection: &Inspection,
 ) {
     while let Ok(cmd) = cmd_rx.try_recv() {
         match cmd {
@@ -728,6 +824,32 @@ fn drain_ui_commands(
                     }
                 }
             }
+            UiCommand::InspectExplorer(id) => {
+                let bag_lines = match api.bag_content(id) {
+                    Ok(bag) if bag.is_empty() => vec!["(bag is empty)".to_string()],
+                    Ok(bag) => bag.iter().map(|(res, count)| format!("{res:?} x{count}")).collect(),
+                    Err(e) => vec![format!("(failed to fetch bag: {e})")],
+                };
+                *inspection.0.lock().unwrap() = InspectionData::ExplorerBag { id, bag_lines };
+            }
+            UiCommand::InspectPlanet(id) => {
+                let data = match api.planet_state(id) {
+                    Ok(s) => InspectionData::PlanetInfo {
+                        id,
+                        energy_cells: s.energy_cells.len(),
+                        charged_cells: s.charged_cells_count,
+                        has_rocket: s.has_rocket,
+                    },
+                    Err(e) => {
+                        eprintln!("[bridge] planet_state({id}) failed: {e}");
+                        InspectionData::PlanetInfo { id, energy_cells: 0, charged_cells: 0, has_rocket: false }
+                    }
+                };
+                *inspection.0.lock().unwrap() = data;
+            }
+            UiCommand::DebugNudgeHostility(delta) => {
+                api.debug_nudge_hostility(delta);
+            }
         }
     }
 }
@@ -740,8 +862,16 @@ fn poll_snapshot(
     mut queue: ResMut<PortraitEventQueue>,
     mut planet_queue: ResMut<PlanetReactionQueue>,
 ) {
-    let Ok(guard) = live.0.try_lock() else { return };
-    let Some(snap) = guard.as_ref() else { return };
+    let Ok(mut guard) = live.0.try_lock() else { return };
+    let Some(snap) = guard.as_mut() else { return };
+    // Drain events immediately. This system runs every rendered frame (up to
+    // 60-144fps) but the bridge thread only produces a new snapshot every
+    // ~250ms — reading `&snap.events` without draining replayed the same
+    // events dozens of times per snapshot, ballooning the portrait reaction
+    // queue into the thousands and burying every new event under a backlog
+    // that would take minutes to play through. That's why nothing new ever
+    // visibly triggered.
+    let events = std::mem::take(&mut snap.events);
     state.ready = true;
 
     let new_personality = snap.personality.clone();
@@ -758,7 +888,7 @@ fn poll_snapshot(
     }
 
     // Use the OLD personality (state.personality) to read intent: events fired under it.
-    for event in &snap.events {
+    for event in &events {
         match event {
             GalaxyEvent::SunraySent { .. } => {
                 let (first, last) = match state.personality {
@@ -779,12 +909,17 @@ fn poll_snapshot(
                 planet_queue.0.push_back(PlanetReaction { planet_id: *planet_id, first: 11, last: 13 });
             }
             GalaxyEvent::AsteroidSent { .. } => {
-                let (first, last) = match state.personality {
-                    Personality::Eclipse => (7, 10),   // Eclipse: sending
-                    Personality::Solace  => (16, 19),  // Solace: unwanted_event
+                // Solace's "unwanted_event" (guilty — she doesn't want to kill)
+                // is high priority: it interrupts whatever's queued/playing
+                // instead of waiting its turn, so it's never buried behind
+                // routine sunray reactions and missed. Eclipse's "sending" is
+                // routine, stays low priority.
+                let (first, last, priority) = match state.personality {
+                    Personality::Eclipse => (7, 10, false),
+                    Personality::Solace  => (16, 19, true),
                 };
                 queue.0.push_back(PortraitReaction {
-                    target: state.personality.clone(), first, last, priority: false,
+                    target: state.personality.clone(), first, last, priority,
                 });
             }
             GalaxyEvent::AsteroidDeflected { planet_id } => {
@@ -800,17 +935,63 @@ fn poll_snapshot(
                 // Trigger the final hit visual; the personality flip handles portraits.
                 planet_queue.0.push_back(PlanetReaction { planet_id: *planet_id, first: 8, last: 10 });
             }
+            GalaxyEvent::ExplorerKilled { explorer_id } => {
+                // No dedicated visual yet — logged so it's visible during testing.
+                println!("[gui] Explorer {explorer_id} died with their planet");
+            }
         }
     }
 
     state.personality = new_personality;
     state.alive = snap.alive_planets.iter().copied().collect();
     state.explorer_planet = snap.explorers.iter().map(|e| (e.id, e.planet)).collect();
+    state.neighbors = snap.neighbors.clone();
     state.hostility = snap.hostility;
     state.phase_elapsed = snap.phase_elapsed;
 }
 
+/// Clears a stale `Selection` once its target no longer exists (destroyed
+/// planet, dead explorer). Without this, a selected-then-destroyed planet
+/// stayed "selected" forever — every subsequent Sunray/Asteroid press kept
+/// targeting the dead planet id and silently failing with "not found",
+/// which looked exactly like the buttons had stopped working.
+fn sync_selection_validity(state: Res<GalaxyState>, mut selection: ResMut<Selection>) {
+    if !state.ready {
+        return;
+    }
+    if let Some(p) = selection.planet {
+        if !state.alive.contains(&p) {
+            selection.planet = None;
+        }
+    }
+    if let Some(e) = selection.explorer {
+        if !state.explorer_planet.contains_key(&e) {
+            selection.explorer = None;
+        }
+    }
+}
+
 // ── Explorer movement ──────────────────────────────────────────────────────────
+
+/// Hides an explorer's sprite once it's no longer in the backend snapshot
+/// (killed when their planet was destroyed). Mirrors `sync_planets` — without
+/// this, a dead explorer's sprite just sits frozen on screen forever, since
+/// nothing else despawns or hides it.
+fn sync_explorers(
+    state: Res<GalaxyState>,
+    mut query: Query<(&ExplorerTag, &mut Visibility)>,
+) {
+    if !state.ready {
+        return;
+    }
+    for (tag, mut vis) in &mut query {
+        *vis = if state.explorer_planet.contains_key(&tag.0) {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+    }
+}
 
 fn drive_explorers(
     state: Res<GalaxyState>,
@@ -1131,7 +1312,7 @@ fn drive_glitch_overlays(
         }
         overlay.remaining = (overlay.remaining - dt).max(0.0);
         let fraction = overlay.remaining / GLITCH_DURATION_SECS;
-        let flicker = ((elapsed * 45.0).sin().abs() * 0.6 + 0.4) as f32;
+        let flicker = ((elapsed * 45.0).sin().abs() * 0.5 + 0.5) as f32;
         image.color.set_alpha(fraction * flicker);
     }
 }
@@ -1324,9 +1505,12 @@ fn follow_cursor(
 
 // ── User input ──────────────────────────────────────────────────────────────────
 //
-// Left-click a planet: send a sunray. Right-click a planet: send an asteroid.
 // Left-click an explorer to select it, then left-click one of the neighboring
-// planets (highlighted in green) to move it there. Space toggles the logic loop.
+// planets (highlighted in green) to move it there. Left-click a planet with no
+// explorer selected to target it for the console's Sunray/Asteroid buttons.
+// Right-click either one to open its hologram (fetches real bag/planet data).
+// Right-click empty space, or the same entity again, to close the hologram.
+// Space toggles the logic loop.
 
 const EXPLORER_HIT_RADIUS: f32 = 28.0 * DISPLAY_SCALE;
 const PLANET_HIT_RADIUS: f32 = 55.0 * DISPLAY_SCALE;
@@ -1340,12 +1524,23 @@ fn handle_input(
     explorers: Query<(&ExplorerTag, &Transform)>,
     state: Res<GalaxyState>,
     mut selection: ResMut<Selection>,
+    mut inspecting: ResMut<Inspecting>,
     mut logic_state: ResMut<LogicRunState>,
     cmds: Res<UiCommands>,
 ) {
     if keys.just_pressed(KeyCode::Space) {
         *logic_state = logic_state.toggled();
         let _ = cmds.0.send(UiCommand::ToggleLogic);
+    }
+
+    // Debug-only: E forces hostility toward Eclipse, S forces it toward
+    // Solace — verifies the flip instantly instead of waiting through real
+    // playtime for enough deaths to accumulate.
+    if keys.just_pressed(KeyCode::KeyE) {
+        let _ = cmds.0.send(UiCommand::DebugNudgeHostility(1.0));
+    }
+    if keys.just_pressed(KeyCode::KeyS) {
+        let _ = cmds.0.send(UiCommand::DebugNudgeHostility(-1.0));
     }
 
     let left = mouse.just_pressed(MouseButton::Left);
@@ -1385,6 +1580,22 @@ fn handle_input(
         }
     }
 
+    if right {
+        for (tag, tf) in &explorers {
+            let pos = Vec2::new(tf.translation.x, tf.translation.y);
+            if pos.distance(world_pos) < EXPLORER_HIT_RADIUS {
+                let target = InspectTarget::Explorer(tag.0);
+                if inspecting.0 == Some(target) {
+                    inspecting.0 = None;
+                } else {
+                    inspecting.0 = Some(target);
+                    let _ = cmds.0.send(UiCommand::InspectExplorer(tag.0));
+                }
+                return;
+            }
+        }
+    }
+
     for (tag, tf) in &planets {
         if !state.alive.contains(&tag.0) {
             continue;
@@ -1394,17 +1605,26 @@ fn handle_input(
             continue;
         }
 
+        if right {
+            let target = InspectTarget::Planet(tag.0);
+            if inspecting.0 == Some(target) {
+                inspecting.0 = None;
+            } else {
+                inspecting.0 = Some(target);
+                let _ = cmds.0.send(UiCommand::InspectPlanet(tag.0));
+            }
+            return;
+        }
+
         if let Some(explorer_id) = selection.explorer {
-            if left {
-                let current = state.explorer_planet.get(&explorer_id).copied();
-                if let Some(current) = current {
-                    if neighbors_of(current).contains(&tag.0) {
-                        let _ = cmds.0.send(UiCommand::MoveExplorer {
-                            explorer_id,
-                            dst: tag.0,
-                        });
-                        selection.explorer = None;
-                    }
+            let current = state.explorer_planet.get(&explorer_id).copied();
+            if let Some(current) = current {
+                if state.neighbors.get(&current).is_some_and(|ns| ns.contains(&tag.0)) {
+                    let _ = cmds.0.send(UiCommand::MoveExplorer {
+                        explorer_id,
+                        dst: tag.0,
+                    });
+                    selection.explorer = None;
                 }
             }
             return;
@@ -1413,40 +1633,50 @@ fn handle_input(
         // No explorer selected — clicking a planet now just selects it for
         // the console's Sunray/Asteroid buttons to act on (spaceship-cockpit
         // theme: the board issues commands, direct clicks just point at things).
-        if left {
-            selection.planet = if selection.planet == Some(tag.0) { None } else { Some(tag.0) };
-        }
+        selection.planet = if selection.planet == Some(tag.0) { None } else { Some(tag.0) };
         return;
+    }
+
+    // Right-click hit nothing inside the viewport — close whatever hologram
+    // is open.
+    if right {
+        inspecting.0 = None;
     }
 }
 
-/// Fires a manual sunray or asteroid on `Selection::planet`, mirroring the
-/// glitch-flash + hostility-nudge that used to happen on direct planet click.
+/// Fires a manual sunray or asteroid on `Selection::planet`. The glitch
+/// always flashes on whoever is *currently in control* (`state.personality`)
+/// — a manual override is "infiltrating" the one steering right now,
+/// regardless of whether the action itself is a sunray or an asteroid. It
+/// used to be hardcoded (sunray -> always Solace, asteroid -> always
+/// Eclipse), which meant an asteroid sent while Solace was in control
+/// glitched Eclipse instead of her.
 fn fire_on_selected_planet(
     selection: &Selection,
     cmds: &UiCommands,
     glitch: &mut GlitchQueue,
+    active: Personality,
     sunray: bool,
 ) {
     let Some(planet_id) = selection.planet else { return };
     if sunray {
         let _ = cmds.0.send(UiCommand::Sunray(planet_id));
-        glitch.0.push(Personality::Solace);
     } else {
         let _ = cmds.0.send(UiCommand::Asteroid(planet_id));
-        glitch.0.push(Personality::Eclipse);
     }
+    glitch.0.push(active);
 }
 
 fn handle_sunray_button(
     interaction_query: Query<&Interaction, (Changed<Interaction>, With<SunrayButtonTag>)>,
     selection: Res<Selection>,
+    state: Res<GalaxyState>,
     cmds: Res<UiCommands>,
     mut glitch: ResMut<GlitchQueue>,
 ) {
     for interaction in &interaction_query {
         if *interaction == Interaction::Pressed {
-            fire_on_selected_planet(&selection, &cmds, &mut glitch, true);
+            fire_on_selected_planet(&selection, &cmds, &mut glitch, state.personality.clone(), true);
         }
     }
 }
@@ -1454,12 +1684,13 @@ fn handle_sunray_button(
 fn handle_asteroid_button(
     interaction_query: Query<&Interaction, (Changed<Interaction>, With<AsteroidButtonTag>)>,
     selection: Res<Selection>,
+    state: Res<GalaxyState>,
     cmds: Res<UiCommands>,
     mut glitch: ResMut<GlitchQueue>,
 ) {
     for interaction in &interaction_query {
         if *interaction == Interaction::Pressed {
-            fire_on_selected_planet(&selection, &cmds, &mut glitch, false);
+            fire_on_selected_planet(&selection, &cmds, &mut glitch, state.personality.clone(), false);
         }
     }
 }
@@ -1475,11 +1706,16 @@ fn is_active_transport(button: &TransportButton, state: LogicRunState) -> bool {
     )
 }
 
+/// Full brightness for the active Start/Pause/Resume button; dimmed (but
+/// still visible, not `Display::None`) for the other two — a gap where a
+/// hidden button used to sit read as broken, not "inactive."
+const TRANSPORT_INACTIVE_TINT: Color = Color::srgba(0.65, 0.65, 0.65, 1.0);
+
 fn sync_transport_buttons(
     mut logic_state: ResMut<LogicRunState>,
     cmds: Res<UiCommands>,
     mut clicked: Query<(&TransportButton, &Interaction), Changed<Interaction>>,
-    mut all_query: Query<(&TransportButton, &mut Node)>,
+    mut all_query: Query<(&TransportButton, &mut ImageNode)>,
 ) {
     for (button, interaction) in &mut clicked {
         if is_active_transport(button, *logic_state) && *interaction == Interaction::Pressed {
@@ -1488,16 +1724,70 @@ fn sync_transport_buttons(
         }
     }
 
-    // `Display::None` instead of `Visibility::Hidden` — these buttons sit in
-    // an absolute-positioned overlay, and toggling Visibility alone wasn't
-    // hiding them in practice; Display::None reliably removes both the
-    // layout and the render output.
-    for (button, mut node) in &mut all_query {
-        node.display = if is_active_transport(button, *logic_state) {
-            Display::Flex
+    for (button, mut image) in &mut all_query {
+        image.color = if is_active_transport(button, *logic_state) {
+            Color::WHITE
         } else {
-            Display::None
+            TRANSPORT_INACTIVE_TINT
         };
+    }
+}
+
+/// Shows/hides each hologram based on `Inspecting`, and only one of the two
+/// at a time (matches the "walls light up one at a time" framing).
+fn sync_hologram_visibility(
+    inspecting: Res<Inspecting>,
+    mut expl_holo: Query<&mut Visibility, (With<ExplorerHologram>, Without<PlanetHologram>)>,
+    mut planet_holo: Query<&mut Visibility, (With<PlanetHologram>, Without<ExplorerHologram>)>,
+) {
+    if !inspecting.is_changed() {
+        return;
+    }
+    let (show_explorer, show_planet) = match inspecting.0 {
+        Some(InspectTarget::Explorer(_)) => (true, false),
+        Some(InspectTarget::Planet(_)) => (false, true),
+        None => (false, false),
+    };
+    for mut v in &mut expl_holo {
+        *v = if show_explorer { Visibility::Visible } else { Visibility::Hidden };
+    }
+    for mut v in &mut planet_holo {
+        *v = if show_planet { Visibility::Visible } else { Visibility::Hidden };
+    }
+}
+
+/// Writes the bridge thread's fetched bag/planet-state data into whichever
+/// hologram text is currently showing it.
+fn sync_hologram_content(
+    inspection: Res<Inspection>,
+    names: Res<PlanetNames>,
+    mut expl_text: Query<&mut Text, (With<ExplorerHologramText>, Without<PlanetHologramText>)>,
+    mut planet_text: Query<&mut Text, (With<PlanetHologramText>, Without<ExplorerHologramText>)>,
+) {
+    let Ok(data) = inspection.0.try_lock() else { return };
+    match &*data {
+        InspectionData::None => {}
+        InspectionData::ExplorerBag { id, bag_lines } => {
+            let mut s = format!("{}\n\nBAG:\n", explorer_display_name(*id));
+            for line in bag_lines {
+                s.push_str("- ");
+                s.push_str(line);
+                s.push('\n');
+            }
+            for mut t in &mut expl_text {
+                *t = Text::new(s.clone());
+            }
+        }
+        InspectionData::PlanetInfo { id, energy_cells, charged_cells, has_rocket } => {
+            let s = format!(
+                "{}\n\nEnergy cells: {charged_cells}/{energy_cells} charged\nRocket: {}",
+                names.get(*id),
+                if *has_rocket { "armed" } else { "none" }
+            );
+            for mut t in &mut planet_text {
+                *t = Text::new(s.clone());
+            }
+        }
     }
 }
 
@@ -1506,7 +1796,10 @@ fn sync_transport_buttons(
 /// cockpit coordinate; nudging `top` directly would move them, not offset
 /// them, since there's no separate "base position" tracked per button).
 fn cockpit_button_hover(
-    mut query: Query<(&Interaction, &mut ImageNode), (Changed<Interaction>, With<Button>)>,
+    mut query: Query<
+        (&Interaction, &mut ImageNode),
+        (Changed<Interaction>, With<Button>, Without<SunrayButtonTag>, Without<AsteroidButtonTag>),
+    >,
 ) {
     for (interaction, mut image) in &mut query {
         image.color = match *interaction {
@@ -1514,6 +1807,23 @@ fn cockpit_button_hover(
             Interaction::Pressed => Color::srgb(0.85, 0.85, 0.85),
             Interaction::None => Color::WHITE,
         };
+    }
+}
+
+/// Dims Sunray/Asteroid when no planet is selected — pressing them then does
+/// nothing (they only act on `Selection::planet`), which read as a silent,
+/// confusing no-op. Now it's visually obvious nothing will happen.
+fn sync_action_buttons_enabled(
+    selection: Res<Selection>,
+    mut query: Query<&mut ImageNode, Or<(With<SunrayButtonTag>, With<AsteroidButtonTag>)>>,
+) {
+    let color = if selection.planet.is_some() {
+        Color::WHITE
+    } else {
+        TRANSPORT_INACTIVE_TINT
+    };
+    for mut image in &mut query {
+        image.color = color;
     }
 }
 
@@ -1530,10 +1840,7 @@ fn draw_selection_highlight(selection: Res<Selection>, state: Res<GalaxyState>, 
         Color::srgba(1.0, 1.0, 0.2, 0.9),
     );
 
-    for neighbor in neighbors_of(current) {
-        if !state.alive.contains(&neighbor) {
-            continue;
-        }
+    for &neighbor in state.neighbors.get(&current).into_iter().flatten() {
         let idx = neighbor.saturating_sub(1) as usize;
         gizmos.circle_2d(
             Isometry2d::from_translation(planet_position(idx)),
@@ -1575,6 +1882,7 @@ fn update_top_bar_cycle(state: Res<GalaxyState>, mut query: Query<&mut Text, Wit
 fn update_chronicle_screen_text(
     state: Res<GalaxyState>,
     selection: Res<Selection>,
+    names: Res<PlanetNames>,
     mut query: Query<&mut Text, With<ChronicleScreenText>>,
 ) {
     let Ok(mut text) = query.single_mut() else { return };
@@ -1582,8 +1890,8 @@ fn update_chronicle_screen_text(
         Personality::Solace => "Solace",
         Personality::Eclipse => "Eclipse",
     };
-    let planet_sel = selection.planet.map_or("none".to_string(), |p| p.to_string());
-    let explorer_sel = selection.explorer.map_or("none".to_string(), |e| e.to_string());
+    let planet_sel = selection.planet.map_or("none".to_string(), |p| names.get(p).to_string());
+    let explorer_sel = selection.explorer.map_or("none".to_string(), |e| explorer_display_name(e).to_string());
     **text = format!(
         "Planets alive: {}/7 | Phase: {personality} ({:.0}%) | Cycle: {}\n\
          Selected planet: {planet_sel} | Selected explorer: {explorer_sel}\n\
@@ -1664,31 +1972,38 @@ fn spawn_cockpit_ui(
             .with_children(|bar| {
                 bar.spawn((
                     Text::new("SOLACE"),
-                    TextFont { font_size: FontSize::Px(16.0), ..default() },
+                    TextFont { font: FontSource::Handle(asset_server.load(FONT_REGULAR)), font_size: FontSize::Px(16.0), ..default() },
                     TextColor(SOLACE_GOLD),
                     TopBarPersonalityText,
                 ));
                 bar.spawn((
                     Text::new("Cycle 00:00"),
-                    TextFont { font_size: FontSize::Px(15.0), ..default() },
+                    TextFont { font: FontSource::Handle(asset_server.load(FONT_REGULAR)), font_size: FontSize::Px(15.0), ..default() },
                     TextColor(Color::srgba(0.85, 0.95, 1.0, 0.9)),
                     TopBarCycleText,
                 ));
             });
 
             // ── Chronicle screen placeholder (real log comes later) ──────────
+            // The panel is chamfered (trapezoidal), not a clean rectangle —
+            // confirmed by sampling cockpit.png directly: at local x=345 only
+            // a thin sliver near y=860-870 is opaque, while at x=400 the full
+            // y=760-880 band is opaque. These bounds (430-1200, 760-860) stay
+            // inside the reliably-opaque interior at every x, clear of the
+            // frame and the angled corners.
             root.spawn((
                 Node {
                     position_type: PositionType::Absolute,
-                    left: Val::Px(340.0 * DISPLAY_SCALE),
-                    top: Val::Px(728.0 * DISPLAY_SCALE),
-                    width: Val::Px(1030.0 * DISPLAY_SCALE),
-                    height: Val::Px(167.0 * DISPLAY_SCALE),
-                    padding: UiRect::all(Val::Px(10.0)),
+                    left: Val::Px(430.0 * DISPLAY_SCALE),
+                    top: Val::Px(760.0 * DISPLAY_SCALE),
+                    width: Val::Px(770.0 * DISPLAY_SCALE),
+                    height: Val::Px(100.0 * DISPLAY_SCALE),
+                    padding: UiRect::all(Val::Px(8.0)),
+                    overflow: Overflow::clip(),
                     ..default()
                 },
                 Text::new(""),
-                TextFont { font_size: FontSize::Px(13.0), ..default() },
+                TextFont { font: FontSource::Handle(asset_server.load(FONT_REGULAR)), font_size: FontSize::Px(12.0), ..default() },
                 TextColor(Color::srgba(0.75, 0.9, 1.0, 0.85)),
                 ChronicleScreenText,
             ));
@@ -1719,16 +2034,52 @@ fn spawn_cockpit_ui(
                 "ECLIPSE",
             );
 
-            // ── Holograms — art wired, hidden until the click-to-open system
-            // exists (next pass). Positioned at their measured resting spot.
+            // ── Holograms — right-click an explorer/planet to open, right-click
+            // again (or empty space) to close. Left = explorer bag contents,
+            // right = planet energy cell / rocket state.
+            let holo_left_w = (HOLOGRAM_LEFT.local.max.x - HOLOGRAM_LEFT.local.min.x) * DISPLAY_SCALE;
             root.spawn((
                 cockpit_button_bundle(asset_server, &HOLOGRAM_LEFT),
                 Visibility::Hidden,
-            ));
+                ExplorerHologram,
+            ))
+            .with_children(|h| {
+                h.spawn((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: Val::Px(30.0),
+                        top: Val::Px(34.0),
+                        width: Val::Px(holo_left_w - 60.0),
+                        ..default()
+                    },
+                    Text::new(""),
+                    TextFont { font: FontSource::Handle(asset_server.load(FONT_REGULAR)), font_size: FontSize::Px(13.0), ..default() },
+                    TextColor(Color::srgba(0.6, 0.9, 1.0, 0.95)),
+                    ExplorerHologramText,
+                ));
+            });
+
+            let holo_right_w = (HOLOGRAM_RIGHT.local.max.x - HOLOGRAM_RIGHT.local.min.x) * DISPLAY_SCALE;
             root.spawn((
                 cockpit_button_bundle(asset_server, &HOLOGRAM_RIGHT),
                 Visibility::Hidden,
-            ));
+                PlanetHologram,
+            ))
+            .with_children(|h| {
+                h.spawn((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: Val::Px(30.0),
+                        top: Val::Px(34.0),
+                        width: Val::Px(holo_right_w - 60.0),
+                        ..default()
+                    },
+                    Text::new(""),
+                    TextFont { font: FontSource::Handle(asset_server.load(FONT_REGULAR)), font_size: FontSize::Px(13.0), ..default() },
+                    TextColor(Color::srgba(1.0, 0.85, 0.6, 0.95)),
+                    PlanetHologramText,
+                ));
+            });
         });
 }
 
@@ -1815,7 +2166,7 @@ fn spawn_portrait_bubble(
         });
         col.spawn((
             Text::new(label),
-            TextFont { font_size: FontSize::Px(13.0), ..default() },
+            TextFont { font: FontSource::Handle(asset_server.load(FONT_REGULAR)), font_size: FontSize::Px(13.0), ..default() },
             TextColor(tint),
         ));
     });

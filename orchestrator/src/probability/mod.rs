@@ -25,8 +25,10 @@ use rand::Rng;
 use std::collections::HashMap;
 
 /// Rate at which `hostility` climbs, tuned so a full 0.0 -> 1.0 ramp takes
-/// about 60 seconds of wall-clock time.
-const HOSTILITY_PER_SEC: f64 = 1.0 / 60.0;
+/// about 480 seconds (8 minutes) of wall-clock time, against a ~10-minute
+/// target full-game length — so hostility isn't already maxed a quarter of
+/// the way in. History: 1/60 (60s) -> 1/240 (4 min) -> 1/480 (8 min).
+const HOSTILITY_PER_SEC: f64 = 1.0 / 480.0;
 
 /// How much a single manual sunray/asteroid override shifts `hostility`.
 pub const MANUAL_OVERRIDE_NUDGE: f64 = 0.075;
@@ -44,20 +46,28 @@ pub const MANUAL_OVERRIDE_NUDGE: f64 = 0.075;
 /// Orbitron generates Hydrogen/Oxygen and combines them into Water before
 /// anything rocket-related happens) — we can't know from here how many
 /// charged cells a given implementation needs before `handle_asteroid` can
-/// ever return `Some(rocket)`. 5 ticks (20s) is a pragmatic buffer, not a
-/// hard guarantee for every possible recipe. Deliberately not re-granted on
+/// ever return `Some(rocket)`.
+///
+/// Was 5 ticks — set when `TICK_INTERVAL` was 4s (20s total). Never revisited
+/// after `TICK_INTERVAL` was raised to 25s for pacing, so grace silently
+/// became 125s (over 2 minutes) of forced safety before anything could
+/// happen — felt like being stuck "recharging" at the start. 2 ticks (50s)
+/// is still more real time than the original 20s design, while cutting the
+/// dead time by more than half. Deliberately not re-granted on
 /// later deaths/reshuffles — only brand-new planets at t=0 have zero
 /// resources; survivors already have some accumulated by the time they're
 /// reassigned a curve.
-const GRACE_TICKS: u32 = 5;
+const GRACE_TICKS: u32 = 2;
 
 /// Events recorded by tick.rs and drained each snapshot build.
+#[derive(Debug)]
 pub enum OrchestratorEvent {
     SunraySent        { planet_id: ID },
     SunrayReceived    { planet_id: ID },
     AsteroidSent      { planet_id: ID },
     AsteroidDeflected { planet_id: ID },
     PlanetDestroyed   { planet_id: ID },
+    ExplorerKilled    { explorer_id: ID },
 }
 
 /// Manages probability curves for all live planets.
@@ -126,21 +136,31 @@ impl ProbabilityRegistry {
         self.hostility = (self.hostility + delta).clamp(0.0, 1.0);
     }
 
-    /// Called when a planet is destroyed. Resets hostility to give survivors
-    /// a calm window, and re-shuffles curve assignments for variety.
+    /// Called when a planet is destroyed. Dampens hostility (relief, not a
+    /// full wipe) and re-shuffles curve assignments for variety.
+    ///
+    /// Retention was 30%, which was still mathematically incapable of
+    /// reaching Eclipse: a real playtest log showed deaths ~90-100s apart.
+    /// With HOSTILITY_PER_SEC's 480s ramp, that's a climb of ~0.19 per cycle;
+    /// at 30% retention the steady-state ceiling solves to
+    /// `0.19 / (1 - 0.3) ≈ 0.27` — permanently below the 0.5 Eclipse
+    /// threshold, no matter how long the game runs. Raised to 65%, giving a
+    /// steady-state ceiling of `0.19 / (1 - 0.65) ≈ 0.54`, comfortably above
+    /// threshold while still cutting hostility by a third on every death.
     ///
     /// Deliberately does NOT reset the phase clock — only `hostility`. Each
     /// planet's own curve keeps running from wherever it was, so a death
     /// doesn't synchronize every survivor's wobble to the same instant.
     pub fn on_planet_death(&mut self, planet_id: ID, rng: &mut impl Rng) {
         self.assignments.remove(&planet_id);
-        self.hostility = 0.0;
+        self.hostility *= 0.65;
 
         let surviving: Vec<ID> = self.assignments.keys().copied().collect();
         self.assignments = Self::shuffle_assignments(&surviving, rng);
 
         log::info!(
-            "Planet {planet_id} destroyed - hostility reset to 0, {} planets remain",
+            "Planet {planet_id} destroyed - hostility dampened to {:.3}, {} planets remain",
+            self.hostility,
             self.assignments.len(),
         );
     }

@@ -6,7 +6,12 @@ use bipolar_shared::{ExplorerSnapshot, GalaxyEvent, GalaxySnapshot, Personality}
 /// sending any channel messages. Safe to call from a background thread
 /// while the logic loop is running.
 pub fn build(api: &OrchestratorApi) -> GalaxySnapshot {
-    let alive_planets = api.topology.lock().unwrap().planet_ids().collect();
+    let (alive_planets, neighbors) = {
+        let topo = api.topology.lock().unwrap();
+        let ids: Vec<u32> = topo.planet_ids().collect();
+        let neighbors = ids.iter().map(|&id| (id, topo.neighbors(id))).collect();
+        (ids, neighbors)
+    };
 
     let explorers = {
         let reg = api.explorers.lock().unwrap();
@@ -33,6 +38,7 @@ pub fn build(api: &OrchestratorApi) -> GalaxySnapshot {
             OrchestratorEvent::AsteroidSent      { planet_id } => GalaxyEvent::AsteroidSent      { planet_id },
             OrchestratorEvent::AsteroidDeflected { planet_id } => GalaxyEvent::AsteroidDeflected { planet_id },
             OrchestratorEvent::PlanetDestroyed   { planet_id } => GalaxyEvent::PlanetDestroyed   { planet_id },
+            OrchestratorEvent::ExplorerKilled { explorer_id } => GalaxyEvent::ExplorerKilled { explorer_id },
         }).collect();
         (p, h, pe, evts)
     };
@@ -44,5 +50,6 @@ pub fn build(api: &OrchestratorApi) -> GalaxySnapshot {
         alive_planets,
         explorers,
         events,
+        neighbors,
     }
 }

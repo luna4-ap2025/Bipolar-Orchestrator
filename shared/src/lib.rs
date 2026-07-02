@@ -21,6 +21,7 @@ pub enum GalaxyEvent {
     AsteroidSent      { planet_id: u32 },
     AsteroidDeflected { planet_id: u32 },
     PlanetDestroyed   { planet_id: u32 },
+    ExplorerKilled    { explorer_id: u32 },
 }
 
 /// Full state of the galaxy, updated ~4 times per second by the bridge thread.
@@ -34,4 +35,7 @@ pub struct GalaxySnapshot {
     pub explorers: Vec<ExplorerSnapshot>,
     /// Events that fired since the last snapshot. Drained on each poll.
     pub events: Vec<GalaxyEvent>,
+    /// Current live adjacency: planet id -> its currently-alive neighbor ids.
+    /// The real topology, not a hardcoded ring — shrinks as planets die.
+    pub neighbors: std::collections::HashMap<u32, Vec<u32>>,
 }

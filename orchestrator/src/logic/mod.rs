@@ -33,12 +33,16 @@ use std::time::Duration;
 
 /// How often the logic loop ticks.
 ///
-/// Was 1 second, which made planets die within a couple of seconds of game
-/// start (barely any time to charge energy cells before a curve swung toward
-/// asteroids). Slowed to 4 seconds; `curves::PERIOD` was scaled by the same
-/// factor so the game keeps the same number of *ticks* per curve phase, just
-/// spread over more real time.
-const TICK_INTERVAL: Duration = Duration::from_secs(4);
+/// History: 1s -> 4s (planets died in seconds). Then at 4s, real playtests
+/// still wiped the whole galaxy in ~24s of actual dispatching — moderate,
+/// ordinary (non-worst-case) per-tick risk in the 40-60% range, rolled
+/// independently across 7 planets every 4s, compounds into total wipeout
+/// almost immediately regardless of how safe any single roll looks. Slowing
+/// hostility and flooring the curves controls *how dangerous* a roll is;
+/// this controls *how often* a roll happens at all — raised to 25s, targeting
+/// a full game lasting roughly 10 minutes. `curves::PERIOD` and
+/// `probability::HOSTILITY_PER_SEC` were scaled to match.
+const TICK_INTERVAL: Duration = Duration::from_secs(25);
 
 /// Signal sent to the logic thread to control it.
 #[derive(Debug, Clone, Copy)]
@@ -189,18 +193,24 @@ fn run_logic_loop(
             break;
         }
 
-        // for each alive planet, roll the dice and send sunray or asteroid
+        // For each alive planet, roll the dice and send sunray or asteroid —
+        // but stop as soon as one planet dies this tick. Dispatching every
+        // planet unconditionally every tick let 3+ planets die in the same
+        // instant (confirmed in a real playtest log), which also crushed
+        // hostility: `on_planet_death`'s dampening applied 2-3 times back to
+        // back within the same tick, before hostility ever had a chance to
+        // climb, which is why Eclipse mode felt unreachable even after
+        // hostility stopped hard-resetting to zero.
         for planet_id in planet_ids {
             let mut prob = prob_registry.lock().unwrap();
             let mut planets_guard = planets.lock().unwrap();
             let mut topology_guard = topology.lock().unwrap();
             let planet_rx_guard = planet_rx.lock().unwrap();
             let mut explorers_guard = explorers.lock().unwrap();
-            let explorer_rx_guard = explorer_rx.lock().unwrap();
 
             let forge_guard = forge.lock().unwrap();
 
-            if let Err(e) = tick::dispatch_to_planet(
+            match tick::dispatch_to_planet(
                 planet_id,
                 &forge_guard,
                 &mut prob,
@@ -208,11 +218,23 @@ fn run_logic_loop(
                 &mut topology_guard,
                 &planet_rx_guard,
                 &mut explorers_guard,
-                &explorer_rx_guard,
                 &mut rng,
             ) {
-                log::error!("Tick dispatch failed for planet {planet_id}: {e}");
+                Ok(destroyed) => {
+                    if destroyed {
+                        break;
+                    }
+                }
+                Err(e) => log::error!("Tick dispatch failed for planet {planet_id}: {e}"),
             }
+        }
+
+        // Game's end condition (spec §1.3): stop once every explorer has died.
+        // Checked every tick since an explorer can die mid-tick when their
+        // planet is destroyed in the loop above.
+        if explorers.lock().unwrap().is_empty() {
+            log::info!("All explorers have died - game over, logic loop exiting");
+            break;
         }
 
         // drain any messages from explorers that arrived autonomously this tick
