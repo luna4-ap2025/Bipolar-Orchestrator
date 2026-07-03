@@ -20,8 +20,8 @@ pub use bipolar::BipolarMode;
 pub use curves::{CurveKind, ProbabilityCurve};
 
 use common_game::utils::ID;
-use rand::seq::SliceRandom;
 use rand::Rng;
+use rand::seq::SliceRandom;
 use std::collections::HashMap;
 
 /// Rate at which `hostility` climbs. The 480s (8-minute) ramp assumed a
@@ -76,13 +76,13 @@ const GRACE_TICKS: u32 = 2;
 /// Events recorded by tick.rs and drained each snapshot build.
 #[derive(Debug)]
 pub enum OrchestratorEvent {
-    SunraySent        { planet_id: ID },
-    SunrayReceived    { planet_id: ID },
-    AsteroidSent      { planet_id: ID },
+    SunraySent { planet_id: ID },
+    SunrayReceived { planet_id: ID },
+    AsteroidSent { planet_id: ID },
     AsteroidDeflected { planet_id: ID },
-    PlanetDestroyed   { planet_id: ID },
-    ExplorerKilled    { explorer_id: ID },
-    ExplorerMoved     { explorer_id: ID, from: ID, to: ID },
+    PlanetDestroyed { planet_id: ID },
+    ExplorerKilled { explorer_id: ID },
+    ExplorerMoved { explorer_id: ID, from: ID, to: ID },
 }
 
 /// Manages probability curves for all live planets.
@@ -96,7 +96,7 @@ pub struct ProbabilityRegistry {
     /// Total ticks elapsed since the registry was created. Only used to gate
     /// [`GRACE_TICKS`] at game start; never reset.
     ticks_elapsed: u32,
-    /// Accumulates events from the logic thread; drained by snapshot::build.
+    /// Accumulates events from the logic thread; drained by `snapshot::build`.
     event_buffer: Vec<OrchestratorEvent>,
 }
 
@@ -135,6 +135,7 @@ impl ProbabilityRegistry {
     /// Sunray probability for `planet_id` at the current phase time, blended
     /// by the current hostility. Returns `0.5` if the planet is not registered.
     /// Forced to `1.0` during [`GRACE_TICKS`] at game start.
+    #[must_use]
     pub fn sunray_probability(&self, planet_id: ID) -> f64 {
         if self.ticks_elapsed <= GRACE_TICKS {
             return 1.0;
@@ -191,14 +192,17 @@ impl ProbabilityRegistry {
     }
 
     /// Derived personality label (`hostility >= 0.5` => Eclipse) for logs/GUI.
+    #[must_use]
     pub fn bipolar_mode(&self) -> BipolarMode {
         BipolarMode::from_hostility(self.hostility)
     }
 
+    #[must_use]
     pub fn hostility(&self) -> f64 {
         self.hostility
     }
 
+    #[must_use]
     pub fn phase_elapsed(&self) -> f64 {
         self.phase_elapsed
     }
@@ -214,6 +218,11 @@ impl ProbabilityRegistry {
 }
 
 #[cfg(test)]
+// `sunray_probability` returns the exact literal `1.0` during the grace
+// period by construction (a guaranteed-sunray sentinel, not a computed
+// float that could drift), so an exact `==`/`assert_eq!` against `1.0` here
+// is correct and intentional, not a precision bug.
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
 
@@ -244,6 +253,9 @@ mod tests {
         }
 
         let all_guaranteed = (1..=7).all(|id| reg.sunray_probability(id) == 1.0);
-        assert!(!all_guaranteed, "grace period should not extend past GRACE_TICKS");
+        assert!(
+            !all_guaranteed,
+            "grace period should not extend past GRACE_TICKS"
+        );
     }
 }

@@ -26,6 +26,11 @@ fn resource_kind(rt: ResourceType) -> Option<ResourceKind> {
 /// Reads the current game state from the API's shared registries without
 /// sending any channel messages. Safe to call from a background thread
 /// while the logic loop is running.
+///
+/// # Panics
+/// If an internal registry mutex is poisoned (a prior panic occurred while
+/// another thread held the lock).
+#[must_use]
 pub fn build(api: &OrchestratorApi) -> GalaxySnapshot {
     let (alive_planets, neighbors) = {
         let topo = api.topology.lock().unwrap();
@@ -54,7 +59,11 @@ pub fn build(api: &OrchestratorApi) -> GalaxySnapshot {
                     .iter()
                     .filter_map(|&(rt, n)| resource_kind(rt).map(|k| (k, n)))
                     .collect();
-                ExplorerSnapshot { id: h.id(), planet: h.current_planet(), bag }
+                ExplorerSnapshot {
+                    id: h.id(),
+                    planet: h.current_planet(),
+                    bag,
+                }
             })
             .collect()
     };
@@ -68,15 +77,39 @@ pub fn build(api: &OrchestratorApi) -> GalaxySnapshot {
         };
         let h = prob.hostility();
         let pe = prob.phase_elapsed();
-        let evts = prob.drain_events().into_iter().map(|e| match e {
-            OrchestratorEvent::SunraySent        { planet_id } => GalaxyEvent::SunraySent        { planet_id },
-            OrchestratorEvent::SunrayReceived    { planet_id } => GalaxyEvent::SunrayReceived    { planet_id },
-            OrchestratorEvent::AsteroidSent      { planet_id } => GalaxyEvent::AsteroidSent      { planet_id },
-            OrchestratorEvent::AsteroidDeflected { planet_id } => GalaxyEvent::AsteroidDeflected { planet_id },
-            OrchestratorEvent::PlanetDestroyed   { planet_id } => GalaxyEvent::PlanetDestroyed   { planet_id },
-            OrchestratorEvent::ExplorerKilled { explorer_id } => GalaxyEvent::ExplorerKilled { explorer_id },
-            OrchestratorEvent::ExplorerMoved { explorer_id, from, to } => GalaxyEvent::ExplorerMoved { explorer_id, from, to },
-        }).collect();
+        let evts = prob
+            .drain_events()
+            .into_iter()
+            .map(|e| match e {
+                OrchestratorEvent::SunraySent { planet_id } => {
+                    GalaxyEvent::SunraySent { planet_id }
+                }
+                OrchestratorEvent::SunrayReceived { planet_id } => {
+                    GalaxyEvent::SunrayReceived { planet_id }
+                }
+                OrchestratorEvent::AsteroidSent { planet_id } => {
+                    GalaxyEvent::AsteroidSent { planet_id }
+                }
+                OrchestratorEvent::AsteroidDeflected { planet_id } => {
+                    GalaxyEvent::AsteroidDeflected { planet_id }
+                }
+                OrchestratorEvent::PlanetDestroyed { planet_id } => {
+                    GalaxyEvent::PlanetDestroyed { planet_id }
+                }
+                OrchestratorEvent::ExplorerKilled { explorer_id } => {
+                    GalaxyEvent::ExplorerKilled { explorer_id }
+                }
+                OrchestratorEvent::ExplorerMoved {
+                    explorer_id,
+                    from,
+                    to,
+                } => GalaxyEvent::ExplorerMoved {
+                    explorer_id,
+                    from,
+                    to,
+                },
+            })
+            .collect();
         (p, h, pe, evts)
     };
 

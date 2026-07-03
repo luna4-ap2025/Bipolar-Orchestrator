@@ -63,6 +63,7 @@ pub enum CurveKind {
 }
 
 impl CurveKind {
+    #[must_use]
     pub fn all() -> Vec<Self> {
         vec![
             Self::Sine,
@@ -75,6 +76,7 @@ impl CurveKind {
         ]
     }
 
+    #[must_use]
     pub fn build(self) -> ProbabilityCurve {
         ProbabilityCurve { kind: self }
     }
@@ -97,10 +99,10 @@ impl ProbabilityCurve {
     fn evaluate_wobble(&self, t: f64) -> f64 {
         match self.kind {
             // (sin(t) + 1) / 2 — oscillates [0, 1] once per PERIOD, starts at 0.5
-            CurveKind::Sine => ((t * ANGULAR_FREQ).sin() + 1.0) / 2.0,
+            CurveKind::Sine => f64::midpoint((t * ANGULAR_FREQ).sin(), 1.0),
 
             // (cos(t) + 1) / 2 — oscillates [0, 1] once per PERIOD, starts at 1.0
-            CurveKind::Cosine => ((t * ANGULAR_FREQ).cos() + 1.0) / 2.0,
+            CurveKind::Cosine => f64::midpoint((t * ANGULAR_FREQ).cos(), 1.0),
 
             // 1 - (t mod T) / T — linear fall from 1.0 to 0.0, then hard reset
             CurveKind::Sawtooth => {
@@ -145,7 +147,9 @@ impl ProbabilityCurve {
 mod tests {
     use super::*;
 
-    fn calm(kind: CurveKind) -> ProbabilityCurve { kind.build() }
+    fn calm(kind: CurveKind) -> ProbabilityCurve {
+        kind.build()
+    }
 
     #[test]
     fn all_curves_return_values_in_unit_interval() {
@@ -177,7 +181,10 @@ mod tests {
     fn zero_hostility_starts_high_or_neutral() {
         for kind in CurveKind::all() {
             let v = calm(kind).evaluate(0.0, 0.0);
-            assert!(v >= 0.5, "{kind:?} at hostility=0 starts at {v}, expected >= 0.5");
+            assert!(
+                v >= 0.5,
+                "{kind:?} at hostility=0 starts at {v}, expected >= 0.5"
+            );
         }
     }
 
@@ -185,7 +192,10 @@ mod tests {
     fn full_hostility_starts_low_or_neutral() {
         for kind in CurveKind::all() {
             let v = calm(kind).evaluate(0.0, 1.0);
-            assert!(v <= 0.5, "{kind:?} at hostility=1 starts at {v}, expected <= 0.5");
+            assert!(
+                v <= 0.5,
+                "{kind:?} at hostility=1 starts at {v}, expected <= 0.5"
+            );
         }
     }
 
@@ -243,7 +253,10 @@ mod tests {
         let t = 0.0;
         let wobble = c.evaluate(t, 0.0);
         let mid = c.evaluate(t, 0.5);
-        assert!((mid - 0.5).abs() < 1e-10, "midpoint hostility should read neutral, got {mid}");
+        assert!(
+            (mid - 0.5).abs() < 1e-10,
+            "midpoint hostility should read neutral, got {mid}"
+        );
         assert!(wobble > mid);
     }
 }

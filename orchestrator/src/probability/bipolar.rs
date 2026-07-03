@@ -15,11 +15,17 @@ pub enum BipolarMode {
 
 impl BipolarMode {
     /// Buckets a continuous hostility value in `[0.0, 1.0]` into a dominant label.
+    #[must_use]
     pub fn from_hostility(hostility: f64) -> Self {
-        if hostility >= 0.5 { Self::Eclipse } else { Self::Solace }
+        if hostility >= 0.5 {
+            Self::Eclipse
+        } else {
+            Self::Solace
+        }
     }
 
     /// Returns `true` if ECLIPSE is currently dominant.
+    #[must_use]
     pub fn is_eclipse(self) -> bool {
         matches!(self, Self::Eclipse)
     }

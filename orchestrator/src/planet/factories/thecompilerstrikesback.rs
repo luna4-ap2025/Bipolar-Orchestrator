@@ -1,4 +1,4 @@
-//! # TheCompilerStrikesBack planet factory — generates Silicon, combines Robot/AIPartner/Diamond
+//! # `TheCompilerStrikesBack` planet factory — generates Silicon, combines Robot/AIPartner/Diamond
 //! ## Owner: Vale
 
 use super::PlanetFactory;
@@ -11,7 +11,9 @@ use crossbeam_channel::{Receiver, Sender};
 pub struct TheCompilerStrikesBackFactory;
 
 impl PlanetFactory for TheCompilerStrikesBackFactory {
-    fn name(&self) -> &'static str { "thecompilerstrikesback" }
+    fn name(&self) -> &'static str {
+        "thecompilerstrikesback"
+    }
 
     fn create(
         &self,

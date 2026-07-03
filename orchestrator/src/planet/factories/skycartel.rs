@@ -11,7 +11,9 @@ use crossbeam_channel::{Receiver, Sender};
 pub struct SkycartelFactory;
 
 impl PlanetFactory for SkycartelFactory {
-    fn name(&self) -> &'static str { "skycartel" }
+    fn name(&self) -> &'static str {
+        "skycartel"
+    }
 
     fn create(
         &self,
@@ -20,6 +22,11 @@ impl PlanetFactory for SkycartelFactory {
         tx_to_orchestrator: Sender<PlanetToOrchestrator>,
         rx_from_explorers: Receiver<ExplorerToPlanet>,
     ) -> Result<Planet, String> {
-        Ok(skycartel::create_planet(id, rx_from_orchestrator, tx_to_orchestrator, rx_from_explorers))
+        Ok(skycartel::create_planet(
+            id,
+            rx_from_orchestrator,
+            tx_to_orchestrator,
+            rx_from_explorers,
+        ))
     }
 }

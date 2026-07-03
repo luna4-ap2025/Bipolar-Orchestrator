@@ -23,10 +23,7 @@ use crate::galaxy::Topology;
 use crate::planet::PlanetRegistry;
 
 use common_game::protocols::orchestrator_explorer::OrchestratorToExplorer;
-use common_game::protocols::orchestrator_planet::{
-    OrchestratorToPlanet,
-    PlanetToOrchestrator,
-};
+use common_game::protocols::orchestrator_planet::{OrchestratorToPlanet, PlanetToOrchestrator};
 use common_game::utils::ID;
 
 use crossbeam_channel::Receiver;
@@ -49,6 +46,10 @@ const MOVE_TIMEOUT: Duration = Duration::from_secs(5);
 /// - [`OrchestratorError::PlanetNotFound`] if either planet does not exist.
 /// - [`OrchestratorError::ExplorerNotFound`] if the explorer does not exist.
 /// - [`OrchestratorError::ChannelError`] if any planet ack times out or a send fails.
+///
+/// # Panics
+/// If the topology, planet registry, or explorer registry mutex is poisoned
+/// (a prior panic occurred while another thread held the lock).
 pub fn execute(
     explorer_id: ID,
     current_planet_id: ID,
@@ -111,7 +112,7 @@ pub fn execute(
             explorer_id,
             new_sender: planet_reply_tx,
         })
-            .map_err(OrchestratorError::ChannelError)?;
+        .map_err(OrchestratorError::ChannelError)?;
     }
 
     wait_for_incoming_ack(planet_ack_rx, dst_planet_id, explorer_id)?;
@@ -163,26 +164,22 @@ fn wait_for_outgoing_ack(
         MOVE_TIMEOUT,
         &format!("OutgoingExplorerResponse from planet {planet_id} for explorer {explorer_id}"),
         |msg| match msg {
-            PlanetToOrchestrator::OutgoingExplorerResponse { res, .. } => {
-                match res {
-                    Ok(()) => Ok(()),
-                    Err(err) => Err(PlanetToOrchestrator::OutgoingExplorerResponse {
-                        res: Err(err),
-                        planet_id,
-                        explorer_id,
-                    }),
-                }
-            }
+            PlanetToOrchestrator::OutgoingExplorerResponse { res, .. } => match res {
+                Ok(()) => Ok(()),
+                Err(err) => Err(PlanetToOrchestrator::OutgoingExplorerResponse {
+                    res: Err(err),
+                    planet_id,
+                    explorer_id,
+                }),
+            },
 
             other => Err(other),
         },
     )
-        .map_err(|err| match err {
-            OrchestratorError::ChannelError(message) => {
-                OrchestratorError::ChannelError(message)
-            }
-            other => other,
-        })
+    .map_err(|err| match err {
+        OrchestratorError::ChannelError(message) => OrchestratorError::ChannelError(message),
+        other => other,
+    })
 }
 
 fn wait_for_incoming_ack(
@@ -195,26 +192,22 @@ fn wait_for_incoming_ack(
         MOVE_TIMEOUT,
         &format!("IncomingExplorerResponse from planet {planet_id} for explorer {explorer_id}"),
         |msg| match msg {
-            PlanetToOrchestrator::IncomingExplorerResponse { res, .. } => {
-                match res {
-                    Ok(()) => Ok(()),
-                    Err(err) => Err(PlanetToOrchestrator::IncomingExplorerResponse {
-                        res: Err(err),
-                        planet_id,
-                        explorer_id,
-                    }),
-                }
-            }
+            PlanetToOrchestrator::IncomingExplorerResponse { res, .. } => match res {
+                Ok(()) => Ok(()),
+                Err(err) => Err(PlanetToOrchestrator::IncomingExplorerResponse {
+                    res: Err(err),
+                    planet_id,
+                    explorer_id,
+                }),
+            },
 
             other => Err(other),
         },
     )
-        .map_err(|err| match err {
-            OrchestratorError::ChannelError(message) => {
-                OrchestratorError::ChannelError(message)
-            }
-            other => other,
-        })
+    .map_err(|err| match err {
+        OrchestratorError::ChannelError(message) => OrchestratorError::ChannelError(message),
+        other => other,
+    })
 }
 
 #[cfg(test)]
@@ -236,10 +229,7 @@ mod tests {
             42, // explorer_id
             1,  // current_planet_id
             3,  // dst_planet_id — NOT a neighbor of 1
-            &topo,
-            &planets,
-            &explorers,
-            &planet_rx,
+            &topo, &planets, &explorers, &planet_rx,
         );
 
         assert!(

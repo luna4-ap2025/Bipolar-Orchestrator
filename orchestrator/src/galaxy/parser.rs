@@ -35,10 +35,7 @@ use std::path::Path;
 /// own neighbor.
 pub fn parse(path: impl AsRef<Path>) -> Result<Topology, OrchestratorError> {
     let content = std::fs::read_to_string(path.as_ref()).map_err(|e| {
-        OrchestratorError::GalaxyFileError(format!(
-            "Cannot read {:?}: {e}",
-            path.as_ref()
-        ))
+        OrchestratorError::GalaxyFileError(format!("Cannot read {}: {e}", path.as_ref().display()))
     })?;
 
     parse_str(&content)

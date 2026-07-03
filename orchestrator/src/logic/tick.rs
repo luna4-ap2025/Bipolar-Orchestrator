@@ -16,8 +16,8 @@ use common_game::protocols::orchestrator_explorer::OrchestratorToExplorer;
 use common_game::protocols::orchestrator_planet::{OrchestratorToPlanet, PlanetToOrchestrator};
 use common_game::utils::ID;
 use crossbeam_channel::Receiver;
-use std::time::Duration;
 use rand::RngExt;
+use std::time::Duration;
 
 /// Timeout when waiting for a planet's acknowledgment.
 const ACK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -38,6 +38,12 @@ const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// # Errors
 /// Returns an error if a channel send/receive fails or times out.
+///
+/// Takes each shared registry as its own parameter (rather than bundling them)
+/// to keep borrow scopes minimal and explicit at each call site; this is a
+/// deliberate, accepted tradeoff against `clippy::pedantic`'s argument-count
+/// threshold.
+#[allow(clippy::too_many_arguments)]
 pub fn dispatch_to_planet(
     planet_id: ID,
     forge: &Forge,
@@ -96,9 +102,10 @@ pub fn dispatch_to_planet(
             ACK_TIMEOUT,
             &format!("AsteroidAck from planet {planet_id}"),
             |msg| match msg {
-                PlanetToOrchestrator::AsteroidAck { planet_id: id, rocket } if id == planet_id => {
-                    Ok((id, rocket))
-                }
+                PlanetToOrchestrator::AsteroidAck {
+                    planet_id: id,
+                    rocket,
+                } if id == planet_id => Ok((id, rocket)),
                 other => Err(other),
             },
         )?;
@@ -125,6 +132,11 @@ pub fn dispatch_to_planet(
 /// until the explorer's `run()` loop actually returns after processing
 /// `KillExplorer`, so there's no need to separately wait for
 /// `KillExplorerResult` on the shared ack channel.
+/// # Errors
+/// Currently always returns `Ok(())`; the `Result` is kept so callers (and
+/// their own error propagation via `?`) don't need to change if a future
+/// change to this function needs to fail (e.g. a channel send error that
+/// should abort the destruction instead of being silently ignored).
 pub fn destroy_planet(
     planet_id: ID,
     planets: &mut PlanetRegistry,
@@ -158,7 +170,7 @@ pub fn destroy_planet(
     let stranded: Vec<ID> = explorers
         .iter()
         .filter(|h| h.current_planet() == planet_id)
-        .map(|h| h.id())
+        .map(super::super::explorer::handle::ExplorerHandle::id)
         .collect();
 
     for explorer_id in stranded {
@@ -172,7 +184,10 @@ pub fn destroy_planet(
         log::info!("Explorer {explorer_id} died along with planet {planet_id}");
     }
 
-    log::info!("Planet {planet_id} removed from galaxy. Killed under: {mode_at_death:?} (now dampened to {:?})", prob_registry.bipolar_mode());
+    log::info!(
+        "Planet {planet_id} removed from galaxy. Killed under: {mode_at_death:?} (now dampened to {:?})",
+        prob_registry.bipolar_mode()
+    );
     Ok(())
 }
 
@@ -203,11 +218,24 @@ mod tests {
         explorers.insert(fake_explorer(1, 1)); // stationed on the doomed planet
         explorers.insert(fake_explorer(2, 2)); // stationed elsewhere
 
-        destroy_planet(1, &mut planets, &mut topology, &mut prob, &mut explorers, &mut rand::rng())
-            .expect("destroy_planet should succeed");
+        destroy_planet(
+            1,
+            &mut planets,
+            &mut topology,
+            &mut prob,
+            &mut explorers,
+            &mut rand::rng(),
+        )
+        .expect("destroy_planet should succeed");
 
-        assert!(explorers.get(1).is_none(), "explorer on the destroyed planet should be killed");
-        assert!(explorers.get(2).is_some(), "explorer on a surviving planet should be untouched");
+        assert!(
+            explorers.get(1).is_none(),
+            "explorer on the destroyed planet should be killed"
+        );
+        assert!(
+            explorers.get(2).is_some(),
+            "explorer on a surviving planet should be untouched"
+        );
     }
 
     #[test]
@@ -218,12 +246,21 @@ mod tests {
         let mut explorers = ExplorerRegistry::new();
         explorers.insert(fake_explorer(7, 1));
 
-        destroy_planet(1, &mut planets, &mut topology, &mut prob, &mut explorers, &mut rand::rng())
-            .expect("destroy_planet should succeed");
+        destroy_planet(
+            1,
+            &mut planets,
+            &mut topology,
+            &mut prob,
+            &mut explorers,
+            &mut rand::rng(),
+        )
+        .expect("destroy_planet should succeed");
 
         let events = prob.drain_events();
         assert!(
-            events.iter().any(|e| matches!(e, OrchestratorEvent::ExplorerKilled { explorer_id: 7 })),
+            events
+                .iter()
+                .any(|e| matches!(e, OrchestratorEvent::ExplorerKilled { explorer_id: 7 })),
             "expected an ExplorerKilled event for explorer 7, got {events:?}"
         );
     }
@@ -235,7 +272,14 @@ mod tests {
         let mut prob = ProbabilityRegistry::new([1, 2].into_iter(), &mut rand::rng());
         let mut explorers = ExplorerRegistry::new();
 
-        let result = destroy_planet(1, &mut planets, &mut topology, &mut prob, &mut explorers, &mut rand::rng());
+        let result = destroy_planet(
+            1,
+            &mut planets,
+            &mut topology,
+            &mut prob,
+            &mut explorers,
+            &mut rand::rng(),
+        );
         assert!(result.is_ok());
         assert!(explorers.is_empty());
     }

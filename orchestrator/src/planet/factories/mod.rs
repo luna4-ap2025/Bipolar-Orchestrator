@@ -42,13 +42,16 @@ pub trait PlanetFactory: Send + Sync {
     fn create(
         &self,
         id: ID,
-        rx_from_orchestrator: Receiver<common_game::protocols::orchestrator_planet::OrchestratorToPlanet>,
+        rx_from_orchestrator: Receiver<
+            common_game::protocols::orchestrator_planet::OrchestratorToPlanet,
+        >,
         tx_to_orchestrator: Sender<PlanetToOrchestrator>,
         rx_from_explorers: Receiver<ExplorerToPlanet>,
     ) -> Result<Planet, String>;
 }
 
 /// Returns one factory instance per external planet.
+#[must_use]
 pub fn all_factories() -> Vec<Box<dyn PlanetFactory>> {
     vec![
         Box::new(orbitron::OrbitronFactory),

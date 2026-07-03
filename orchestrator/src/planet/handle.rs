@@ -52,11 +52,13 @@ impl PlanetHandle {
     }
 
     /// Returns the planet's unique ID.
+    #[must_use]
     pub fn id(&self) -> ID {
         self.id
     }
 
     /// Returns the planet's display label.
+    #[must_use]
     pub fn label(&self) -> &str {
         &self.label
     }
@@ -73,6 +75,7 @@ impl PlanetHandle {
 
     /// Returns a clone of the sender used to deliver explorer messages to this
     /// planet. Given to an explorer when it moves to this planet.
+    #[must_use]
     pub fn explorer_sender(&self) -> Sender<ExplorerToPlanet> {
         self.explorer_tx.clone()
     }
@@ -81,10 +84,10 @@ impl PlanetHandle {
     ///
     /// Should be called after sending [`OrchestratorToPlanet::KillPlanet`].
     pub fn join(&mut self) {
-        if let Some(handle) = self.thread_handle.take() {
-            if let Err(e) = handle.join() {
-                log::error!("Planet {} thread panicked: {e:?}", self.id);
-            }
+        if let Some(handle) = self.thread_handle.take()
+            && let Err(e) = handle.join()
+        {
+            log::error!("Planet {} thread panicked: {e:?}", self.id);
         }
     }
 }

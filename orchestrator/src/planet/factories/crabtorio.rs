@@ -11,7 +11,9 @@ use crossbeam_channel::{Receiver, Sender};
 pub struct CrabtorioFactory;
 
 impl PlanetFactory for CrabtorioFactory {
-    fn name(&self) -> &'static str { "crabtorio" }
+    fn name(&self) -> &'static str {
+        "crabtorio"
+    }
 
     fn create(
         &self,
@@ -20,6 +22,11 @@ impl PlanetFactory for CrabtorioFactory {
         tx_to_orchestrator: Sender<PlanetToOrchestrator>,
         rx_from_explorers: Receiver<ExplorerToPlanet>,
     ) -> Result<Planet, String> {
-        Ok(planet::create_planet(id, rx_from_orchestrator, tx_to_orchestrator, rx_from_explorers))
+        Ok(planet::create_planet(
+            id,
+            rx_from_orchestrator,
+            tx_to_orchestrator,
+            rx_from_explorers,
+        ))
     }
 }

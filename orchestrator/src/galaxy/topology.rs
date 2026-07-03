@@ -31,12 +31,14 @@ impl Topology {
     }
 
     /// Returns `true` if the planet with `id` is still alive in the galaxy.
+    #[must_use]
     pub fn contains(&self, id: ID) -> bool {
         self.adjacency.contains_key(&id)
     }
 
     /// Returns the neighbor IDs of `planet_id`, or an empty slice if the planet
     /// does not exist.
+    #[must_use]
     pub fn neighbors(&self, planet_id: ID) -> Vec<ID> {
         self.adjacency
             .get(&planet_id)
@@ -45,11 +47,9 @@ impl Topology {
     }
 
     /// Returns `true` if `a` and `b` are neighbors.
+    #[must_use]
     pub fn are_neighbors(&self, a: ID, b: ID) -> bool {
-        self.adjacency
-            .get(&a)
-            .map(|s| s.contains(&b))
-            .unwrap_or(false)
+        self.adjacency.get(&a).is_some_and(|s| s.contains(&b))
     }
 
     /// Permanently removes `planet_id` from the galaxy, also removing it from
@@ -67,6 +67,7 @@ impl Topology {
     }
 
     /// Returns the total number of alive planets.
+    #[must_use]
     pub fn planet_count(&self) -> usize {
         self.adjacency.len()
     }

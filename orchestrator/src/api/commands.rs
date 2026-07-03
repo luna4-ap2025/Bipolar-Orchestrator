@@ -12,14 +12,33 @@ use common_game::utils::ID;
 pub enum Command {
     Start,
     Stop,
-    Sunray { planet_id: ID },
-    Asteroid { planet_id: ID },
-    MoveExplorer { explorer_id: ID, planet_id: ID },
-    Bag { explorer_id: ID },
-    PlanetState { planet_id: ID },
-    GenerateResource { explorer_id: ID, resource: BasicResourceType },
-    CombineResource { explorer_id: ID, resource: ComplexResourceType },
-    Neighbors { planet_id: ID },
+    Sunray {
+        planet_id: ID,
+    },
+    Asteroid {
+        planet_id: ID,
+    },
+    MoveExplorer {
+        explorer_id: ID,
+        planet_id: ID,
+    },
+    Bag {
+        explorer_id: ID,
+    },
+    PlanetState {
+        planet_id: ID,
+    },
+    GenerateResource {
+        explorer_id: ID,
+        resource: BasicResourceType,
+    },
+    CombineResource {
+        explorer_id: ID,
+        resource: ComplexResourceType,
+    },
+    Neighbors {
+        planet_id: ID,
+    },
     AlivePlanets,
     Help,
     Quit,
@@ -69,31 +88,37 @@ pub fn parse(input: &str) -> Result<Command, String> {
         "move" => {
             let explorer_id = parse_id(&mut parts, "explorer_id")?;
             let planet_id = parse_id(&mut parts, "planet_id")?;
-            Ok(Command::MoveExplorer { explorer_id, planet_id })
+            Ok(Command::MoveExplorer {
+                explorer_id,
+                planet_id,
+            })
         }
 
         "generate" => {
             let explorer_id = parse_id(&mut parts, "explorer_id")?;
             let resource_name = parts.next().ok_or("generate <explorer_id> <resource>")?;
             let resource = parse_basic_resource(resource_name)?;
-            Ok(Command::GenerateResource { explorer_id, resource })
+            Ok(Command::GenerateResource {
+                explorer_id,
+                resource,
+            })
         }
 
         "combine" => {
             let explorer_id = parse_id(&mut parts, "explorer_id")?;
             let resource_name = parts.next().ok_or("combine <explorer_id> <resource>")?;
             let resource = parse_complex_resource(resource_name)?;
-            Ok(Command::CombineResource { explorer_id, resource })
+            Ok(Command::CombineResource {
+                explorer_id,
+                resource,
+            })
         }
 
         other => Err(format!("Unknown command '{other}'. Type 'help'.")),
     }
 }
 
-fn parse_id<'a>(
-    parts: &mut impl Iterator<Item = &'a str>,
-    name: &str,
-) -> Result<ID, String> {
+fn parse_id<'a>(parts: &mut impl Iterator<Item = &'a str>, name: &str) -> Result<ID, String> {
     parts
         .next()
         .ok_or_else(|| format!("Missing argument: {name}"))?
@@ -107,7 +132,9 @@ fn parse_basic_resource(s: &str) -> Result<BasicResourceType, String> {
         "hydrogen" => Ok(BasicResourceType::Hydrogen),
         "carbon" => Ok(BasicResourceType::Carbon),
         "silicon" => Ok(BasicResourceType::Silicon),
-        other => Err(format!("Unknown basic resource '{other}'. Options: oxygen, hydrogen, carbon, silicon")),
+        other => Err(format!(
+            "Unknown basic resource '{other}'. Options: oxygen, hydrogen, carbon, silicon"
+        )),
     }
 }
 
@@ -119,7 +146,9 @@ fn parse_complex_resource(s: &str) -> Result<ComplexResourceType, String> {
         "robot" => Ok(ComplexResourceType::Robot),
         "dolphin" => Ok(ComplexResourceType::Dolphin),
         "aipartner" => Ok(ComplexResourceType::AIPartner),
-        other => Err(format!("Unknown complex resource '{other}'. Options: water, diamond, life, robot, dolphin, aipartner")),
+        other => Err(format!(
+            "Unknown complex resource '{other}'. Options: water, diamond, life, robot, dolphin, aipartner"
+        )),
     }
 }
 
@@ -134,17 +163,17 @@ mod tests {
 
     #[test]
     fn parses_sunray() {
-        assert_eq!(
-            parse("sunray 3").unwrap(),
-            Command::Sunray { planet_id: 3 }
-        );
+        assert_eq!(parse("sunray 3").unwrap(), Command::Sunray { planet_id: 3 });
     }
 
     #[test]
     fn parses_move() {
         assert_eq!(
             parse("move 1 5").unwrap(),
-            Command::MoveExplorer { explorer_id: 1, planet_id: 5 }
+            Command::MoveExplorer {
+                explorer_id: 1,
+                planet_id: 5
+            }
         );
     }
 

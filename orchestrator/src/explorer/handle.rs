@@ -8,8 +8,7 @@
 
 use common_game::components::resource::ResourceType;
 use common_game::protocols::orchestrator_explorer::{
-    ExplorerToOrchestrator,
-    OrchestratorToExplorer,
+    ExplorerToOrchestrator, OrchestratorToExplorer,
 };
 use common_game::protocols::planet_explorer::PlanetToExplorer;
 use common_game::utils::ID;
@@ -59,6 +58,7 @@ pub struct ExplorerHandle {
 
 impl ExplorerHandle {
     /// Constructs a new `ExplorerHandle`.
+    #[must_use]
     pub fn new(
         id: ID,
         sender: Sender<OrchestratorToExplorer>,
@@ -77,11 +77,13 @@ impl ExplorerHandle {
     }
 
     /// Returns the explorer's unique ID.
+    #[must_use]
     pub fn id(&self) -> ID {
         self.id
     }
 
     /// Returns the ID of the planet the explorer is currently on.
+    #[must_use]
     pub fn current_planet(&self) -> ID {
         self.current_planet
     }
@@ -93,6 +95,7 @@ impl ExplorerHandle {
 
     /// Returns the last `BagContentResponse` the logic loop's drain has
     /// recorded for this explorer (empty until the first one arrives).
+    #[must_use]
     pub fn bag(&self) -> &BagContent {
         &self.last_bag
     }
@@ -105,6 +108,7 @@ impl ExplorerHandle {
     }
 
     /// Returns the sender that planets use to reply to this explorer.
+    #[must_use]
     pub fn planet_reply_tx(&self) -> Sender<PlanetToExplorer> {
         self.planet_reply_tx.clone()
     }
@@ -121,10 +125,10 @@ impl ExplorerHandle {
 
     /// Waits for the explorer thread to finish.
     pub fn join(&mut self) {
-        if let Some(handle) = self.thread_handle.take() {
-            if let Err(e) = handle.join() {
-                log::error!("Explorer {} thread panicked: {e:?}", self.id);
-            }
+        if let Some(handle) = self.thread_handle.take()
+            && let Err(e) = handle.join()
+        {
+            log::error!("Explorer {} thread panicked: {e:?}", self.id);
         }
     }
 }

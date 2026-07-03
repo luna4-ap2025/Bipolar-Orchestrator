@@ -11,7 +11,9 @@ use crossbeam_channel::{Receiver, Sender};
 pub struct RustrelliFatory;
 
 impl PlanetFactory for RustrelliFatory {
-    fn name(&self) -> &'static str { "rustrelli" }
+    fn name(&self) -> &'static str {
+        "rustrelli"
+    }
 
     fn create(
         &self,

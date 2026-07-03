@@ -18,6 +18,7 @@ pub struct ExplorerRegistry {
 
 impl ExplorerRegistry {
     /// Creates an empty registry.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             handles: HashMap::new(),
@@ -30,6 +31,7 @@ impl ExplorerRegistry {
     }
 
     /// Returns an immutable reference to the handle for `explorer_id`.
+    #[must_use]
     pub fn get(&self, explorer_id: ID) -> Option<&ExplorerHandle> {
         self.handles.get(&explorer_id)
     }
@@ -51,6 +53,7 @@ impl ExplorerRegistry {
 
     /// Returns `true` if no explorers remain — the game's end condition
     /// (spec §1.3: "when no Explorer remains, the game ends").
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.handles.is_empty()
     }

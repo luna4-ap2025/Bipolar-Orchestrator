@@ -5,8 +5,8 @@
 //!
 //! ## Owner: Vivi
 
-use super::factories::PlanetFactory;
 use super::PlanetHandle;
+use super::factories::PlanetFactory;
 use crate::error::OrchestratorError;
 use common_game::protocols::orchestrator_planet::PlanetToOrchestrator;
 use common_game::utils::ID;
@@ -18,7 +18,7 @@ pub struct SpawnedPlanetChannels {
     /// The orchestrator already owns this; this field is not included here.
     /// Instead the planet's *sender* half is given to the planet thread.
     ///
-    /// This struct only carries the PlanetToOrchestrator sender so the planet
+    /// This struct only carries the `PlanetToOrchestrator` sender so the planet
     /// thread can send back to the orchestrator.
     ///
     /// Actually see design note below.
@@ -55,7 +55,7 @@ pub fn spawn_planet(
     // call the planet group's factory to get the Planet struct
     let mut planet = factory
         .create(id, rx_from_orch, orch_tx, rx_from_explorers)
-        .map_err(|e| OrchestratorError::PlanetConstructionError(e))?;
+        .map_err(OrchestratorError::PlanetConstructionError)?;
 
     // spawn the planet in its own thread
     let label_clone = label.clone();

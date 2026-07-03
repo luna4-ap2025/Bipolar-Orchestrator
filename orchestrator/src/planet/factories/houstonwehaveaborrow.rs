@@ -20,7 +20,9 @@ use crossbeam_channel::{Receiver, Sender};
 pub struct HoustonFactory;
 
 impl PlanetFactory for HoustonFactory {
-    fn name(&self) -> &'static str { "houstonwehaveaborrow" }
+    fn name(&self) -> &'static str {
+        "houstonwehaveaborrow"
+    }
 
     fn create(
         &self,

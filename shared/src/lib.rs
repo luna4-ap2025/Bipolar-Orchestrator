@@ -35,13 +35,29 @@ pub struct ExplorerSnapshot {
 /// A discrete event that fired during one logic tick.
 #[derive(Clone, Debug)]
 pub enum GalaxyEvent {
-    SunraySent        { planet_id: u32 },
-    SunrayReceived    { planet_id: u32 },
-    AsteroidSent      { planet_id: u32 },
-    AsteroidDeflected { planet_id: u32 },
-    PlanetDestroyed   { planet_id: u32 },
-    ExplorerKilled    { explorer_id: u32 },
-    ExplorerMoved     { explorer_id: u32, from: u32, to: u32 },
+    SunraySent {
+        planet_id: u32,
+    },
+    SunrayReceived {
+        planet_id: u32,
+    },
+    AsteroidSent {
+        planet_id: u32,
+    },
+    AsteroidDeflected {
+        planet_id: u32,
+    },
+    PlanetDestroyed {
+        planet_id: u32,
+    },
+    ExplorerKilled {
+        explorer_id: u32,
+    },
+    ExplorerMoved {
+        explorer_id: u32,
+        from: u32,
+        to: u32,
+    },
 }
 
 /// Full state of the galaxy, updated ~4 times per second by the bridge thread.

@@ -21,17 +21,25 @@ use std::path::Path;
 pub type PlanetConfigMap = HashMap<ID, String>;
 
 /// Parses the planet config file at `path`.
+///
+/// # Errors
+/// [`OrchestratorError::GalaxyFileError`] if the file cannot be read, or if
+/// its contents fail to parse (see [`parse_str`]).
 pub fn parse(path: impl AsRef<Path>) -> Result<PlanetConfigMap, OrchestratorError> {
     let content = std::fs::read_to_string(path.as_ref()).map_err(|e| {
         OrchestratorError::GalaxyFileError(format!(
-            "cannot read planet config {:?}: {e}",
-            path.as_ref()
+            "cannot read planet config {}: {e}",
+            path.as_ref().display()
         ))
     })?;
     parse_str(&content)
 }
 
 /// Parses planet config from a string.
+///
+/// # Errors
+/// [`OrchestratorError::GalaxyFileError`] if the `[planets]` section header is
+/// missing, or if any `<id> = "<name>"` assignment line is malformed.
 pub fn parse_str(content: &str) -> Result<PlanetConfigMap, OrchestratorError> {
     let mut map = PlanetConfigMap::new();
     let mut in_planets_section = false;

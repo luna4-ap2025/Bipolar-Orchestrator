@@ -21,8 +21,8 @@ pub mod event_handler;
 pub mod tick;
 
 use crate::error::OrchestratorError;
-use crate::explorer::handle::ExplorerToOrchestratorMsg;
 use crate::explorer::ExplorerRegistry;
+use crate::explorer::handle::ExplorerToOrchestratorMsg;
 use crate::galaxy::Topology;
 use crate::planet::PlanetRegistry;
 use crate::probability::ProbabilityRegistry;
@@ -30,7 +30,7 @@ use crate::probability::ProbabilityRegistry;
 use common_game::components::forge::Forge;
 use common_game::protocols::orchestrator_planet::PlanetToOrchestrator;
 
-use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -64,6 +64,7 @@ pub struct LogicController {
 
 impl LogicController {
     /// Creates a new stopped controller.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             control_tx: None,
@@ -72,6 +73,7 @@ impl LogicController {
     }
 
     /// Returns `true` if the logic loop is currently running.
+    #[must_use]
     pub fn is_running(&self) -> bool {
         self.control_tx.is_some()
     }
@@ -82,6 +84,12 @@ impl LogicController {
     ///
     /// # Errors
     /// Returns [`OrchestratorError::InvalidState`] if already running.
+    ///
+    /// Takes each shared registry as its own `Arc<Mutex<_>>` parameter (rather
+    /// than bundling them into a struct) to mirror `OrchestratorApi`'s own
+    /// field layout one-to-one; this is a deliberate, accepted tradeoff
+    /// against `clippy::pedantic`'s argument-count threshold.
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         &mut self,
         topology: Arc<Mutex<Topology>>,
@@ -129,17 +137,18 @@ impl LogicController {
     /// # Errors
     /// Returns [`OrchestratorError::InvalidState`] if not running.
     pub fn stop(&mut self) -> Result<(), OrchestratorError> {
-        let tx = self.control_tx.take().ok_or_else(|| {
-            OrchestratorError::InvalidState("Logic is not running".to_string())
-        })?;
+        let tx = self
+            .control_tx
+            .take()
+            .ok_or_else(|| OrchestratorError::InvalidState("Logic is not running".to_string()))?;
 
         // Send stop signal. It is fine if it fails: the thread may have exited already.
         let _ = tx.send(ControlSignal::Stop);
 
-        if let Some(handle) = self.thread_handle.take() {
-            if let Err(e) = handle.join() {
-                log::error!("Logic thread panicked: {e:?}");
-            }
+        if let Some(handle) = self.thread_handle.take()
+            && let Err(e) = handle.join()
+        {
+            log::error!("Logic thread panicked: {e:?}");
         }
 
         log::info!("Logic loop stopped");
@@ -162,6 +171,14 @@ impl Default for LogicController {
 /// Important behavior:
 /// - explorer messages are drained every [`MESSAGE_POLL_INTERVAL`];
 /// - probability/asteroid/sunray ticks run only every [`TICK_INTERVAL`].
+///
+/// Takes owned `Arc<Mutex<_>>` clones (not references) by design: this
+/// function is spawned into its own thread, which requires `'static` owned
+/// handles to move into the closure — `clippy::pedantic`'s
+/// `needless_pass_by_value` doesn't account for that requirement. It also
+/// mirrors `OrchestratorApi`'s field layout one-to-one, hence the argument
+/// count.
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn run_logic_loop(
     topology: Arc<Mutex<Topology>>,
     planets: Arc<Mutex<PlanetRegistry>>,

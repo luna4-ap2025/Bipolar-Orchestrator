@@ -17,9 +17,18 @@ use std::collections::HashMap;
 ///
 /// - Jeb (id 2) starts on planet 1.
 /// - Viviana (id 1) starts on planet 4.
+///
+/// # Panics
+/// If `galaxy_src` or `planets_src` is malformed, or if the [`Forge`]
+/// singleton has already been created in this process. These are treated as
+/// unrecoverable startup errors: this function is only ever called once, at
+/// process start, so there is no meaningful way to continue with an invalid
+/// galaxy definition.
+#[must_use]
 pub fn build_api(galaxy_src: &str, planets_src: &str) -> OrchestratorApi {
     let topology = galaxy::parser::parse_str(galaxy_src).expect("invalid galaxy source");
-    let planet_config = galaxy::planet_config::parse_str(planets_src).expect("invalid planets source");
+    let planet_config =
+        galaxy::planet_config::parse_str(planets_src).expect("invalid planets source");
 
     let (planet_tx, planet_rx) = unbounded::<PlanetToOrchestrator>();
 
@@ -37,9 +46,8 @@ pub fn build_api(galaxy_src: &str, planets_src: &str) -> OrchestratorApi {
         let factory = factories
             .get(&factory_name.to_lowercase())
             .expect("unknown planet factory");
-        let handle =
-            planet::spawn_planet(id, factory.name(), factory.as_ref(), planet_tx.clone())
-                .expect("failed to spawn planet");
+        let handle = planet::spawn_planet(id, factory.name(), factory.as_ref(), planet_tx.clone())
+            .expect("failed to spawn planet");
         planet_registry.insert(handle);
     }
 
@@ -68,7 +76,13 @@ pub fn build_api(galaxy_src: &str, planets_src: &str) -> OrchestratorApi {
             .name("explorer-viviana".into())
             .spawn(move || viv.run())
             .expect("failed to spawn Viviana thread");
-        explorer_registry.insert(ExplorerHandle::new(1, tx_to_viv, planet_reply_tx, 4, thread));
+        explorer_registry.insert(ExplorerHandle::new(
+            1,
+            tx_to_viv,
+            planet_reply_tx,
+            4,
+            thread,
+        ));
     }
 
     // Jeb — id 2, starts on planet 1 (ring index 0)
@@ -96,7 +110,13 @@ pub fn build_api(galaxy_src: &str, planets_src: &str) -> OrchestratorApi {
                 }
             })
             .expect("failed to spawn Jeb thread");
-        explorer_registry.insert(ExplorerHandle::new(2, tx_to_jeb, planet_reply_tx, 1, thread));
+        explorer_registry.insert(ExplorerHandle::new(
+            2,
+            tx_to_jeb,
+            planet_reply_tx,
+            1,
+            thread,
+        ));
     }
 
     let mut rng = rand::rng();

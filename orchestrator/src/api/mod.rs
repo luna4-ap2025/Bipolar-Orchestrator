@@ -21,8 +21,7 @@ use crate::probability::ProbabilityRegistry;
 use common_game::components::forge::Forge;
 use common_game::components::planet::DummyPlanetState;
 use common_game::protocols::orchestrator_explorer::{
-    ExplorerToOrchestrator,
-    OrchestratorToExplorer,
+    ExplorerToOrchestrator, OrchestratorToExplorer,
 };
 use common_game::protocols::orchestrator_planet::{OrchestratorToPlanet, PlanetToOrchestrator};
 use common_game::utils::ID;
@@ -45,10 +44,11 @@ pub struct OrchestratorApi {
     pub(crate) planets: Arc<Mutex<PlanetRegistry>>,
     pub(crate) explorers: Arc<Mutex<ExplorerRegistry>>,
     pub(crate) prob_registry: Arc<Mutex<ProbabilityRegistry>>,
-    /// Shared receiver for all PlanetToOrchestrator messages.
+    /// Shared receiver for all `PlanetToOrchestrator` messages.
     pub(crate) planet_rx: Arc<Mutex<Receiver<PlanetToOrchestrator>>>,
-    /// Shared receiver for all ExplorerToOrchestrator messages.
-    pub(crate) explorer_rx: Arc<Mutex<Receiver<crate::explorer::handle::ExplorerToOrchestratorMsg>>>,
+    /// Shared receiver for all `ExplorerToOrchestrator` messages.
+    pub(crate) explorer_rx:
+        Arc<Mutex<Receiver<crate::explorer::handle::ExplorerToOrchestratorMsg>>>,
     /// The forge used to generate sunrays and asteroids.
     pub(crate) forge: Arc<Mutex<Forge>>,
     /// Controls the autonomous game logic thread.
@@ -57,6 +57,7 @@ pub struct OrchestratorApi {
 
 impl OrchestratorApi {
     /// Creates a new orchestrator API from already-spawned game components.
+    #[must_use]
     pub fn new(
         topology: Topology,
         planets: PlanetRegistry,
@@ -86,6 +87,10 @@ impl OrchestratorApi {
     ///
     /// # Errors
     /// Returns [`OrchestratorError::InvalidState`] if already running.
+    ///
+    /// # Panics
+    /// If an internal registry mutex is poisoned (a prior panic occurred while
+    /// another thread held the lock).
     pub fn start_logic(&mut self) -> Result<(), OrchestratorError> {
         // Start all explorer AIs
         {
@@ -109,24 +114,22 @@ impl OrchestratorApi {
         // left over on the shared receiver rather than misreading them.
         let mut pending_planets: std::collections::HashSet<ID> = {
             let planets = self.planets.lock().unwrap();
-            planets.iter().map(|h| h.id()).collect()
+            planets
+                .iter()
+                .map(super::planet::handle::PlanetHandle::id)
+                .collect()
         };
 
         while !pending_planets.is_empty() {
             let rx = self.planet_rx.lock().unwrap();
-            let planet_id = recv_ack(
-                &rx,
-                API_TIMEOUT,
-                "StartPlanetAIResult",
-                |msg| match msg {
-                    PlanetToOrchestrator::StartPlanetAIResult { planet_id }
-                        if pending_planets.contains(&planet_id) =>
-                    {
-                        Ok(planet_id)
-                    }
-                    other => Err(other),
-                },
-            )?;
+            let planet_id = recv_ack(&rx, API_TIMEOUT, "StartPlanetAIResult", |msg| match msg {
+                PlanetToOrchestrator::StartPlanetAIResult { planet_id }
+                    if pending_planets.contains(&planet_id) =>
+                {
+                    Ok(planet_id)
+                }
+                other => Err(other),
+            })?;
             pending_planets.remove(&planet_id);
         }
 
@@ -135,24 +138,23 @@ impl OrchestratorApi {
         // rather than misreading them as a fatal protocol error.
         let mut pending_explorers: std::collections::HashSet<ID> = {
             let explorers = self.explorers.lock().unwrap();
-            explorers.iter().map(|h| h.id()).collect()
+            explorers
+                .iter()
+                .map(super::explorer::handle::ExplorerHandle::id)
+                .collect()
         };
 
         while !pending_explorers.is_empty() {
             let rx = self.explorer_rx.lock().unwrap();
-            let explorer_id = recv_ack(
-                &rx,
-                API_TIMEOUT,
-                "StartExplorerAIResult",
-                |msg| match msg {
+            let explorer_id =
+                recv_ack(&rx, API_TIMEOUT, "StartExplorerAIResult", |msg| match msg {
                     ExplorerToOrchestrator::StartExplorerAIResult { explorer_id }
                         if pending_explorers.contains(&explorer_id) =>
                     {
                         Ok(explorer_id)
                     }
                     other => Err(other),
-                },
-            )?;
+                })?;
             pending_explorers.remove(&explorer_id);
         }
 
@@ -177,6 +179,10 @@ impl OrchestratorApi {
     ///
     /// # Errors
     /// Returns [`OrchestratorError::InvalidState`] if not running.
+    ///
+    /// # Panics
+    /// If an internal registry mutex is poisoned (a prior panic occurred while
+    /// another thread held the lock).
     pub fn stop_logic(&mut self) -> Result<(), OrchestratorError> {
         self.logic.stop()?;
 
@@ -185,7 +191,10 @@ impl OrchestratorApi {
             for h in explorers.iter() {
                 let _ = h.send(OrchestratorToExplorer::StopExplorerAI);
             }
-            explorers.iter().map(|h| h.id()).collect()
+            explorers
+                .iter()
+                .map(super::explorer::handle::ExplorerHandle::id)
+                .collect()
         };
 
         // Wait for these acks now (rather than firing and forgetting) so a
@@ -193,19 +202,15 @@ impl OrchestratorApi {
         // StartExplorerAIResult a subsequent `start_logic` is waiting for.
         while !pending_explorers.is_empty() {
             let rx = self.explorer_rx.lock().unwrap();
-            let explorer_id = recv_ack(
-                &rx,
-                API_TIMEOUT,
-                "StopExplorerAIResult",
-                |msg| match msg {
+            let explorer_id =
+                recv_ack(&rx, API_TIMEOUT, "StopExplorerAIResult", |msg| match msg {
                     ExplorerToOrchestrator::StopExplorerAIResult { explorer_id }
                         if pending_explorers.contains(&explorer_id) =>
                     {
                         Ok(explorer_id)
                     }
                     other => Err(other),
-                },
-            )?;
+                })?;
             pending_explorers.remove(&explorer_id);
         }
 
@@ -215,24 +220,22 @@ impl OrchestratorApi {
                 h.send(OrchestratorToPlanet::StopPlanetAI)
                     .map_err(OrchestratorError::ChannelError)?;
             }
-            planets.iter().map(|h| h.id()).collect()
+            planets
+                .iter()
+                .map(super::planet::handle::PlanetHandle::id)
+                .collect()
         };
 
         while !pending_planets.is_empty() {
             let rx = self.planet_rx.lock().unwrap();
-            let planet_id = recv_ack(
-                &rx,
-                API_TIMEOUT,
-                "StopPlanetAIResult",
-                |msg| match msg {
-                    PlanetToOrchestrator::StopPlanetAIResult { planet_id }
-                        if pending_planets.contains(&planet_id) =>
-                    {
-                        Ok(planet_id)
-                    }
-                    other => Err(other),
-                },
-            )?;
+            let planet_id = recv_ack(&rx, API_TIMEOUT, "StopPlanetAIResult", |msg| match msg {
+                PlanetToOrchestrator::StopPlanetAIResult { planet_id }
+                    if pending_planets.contains(&planet_id) =>
+                {
+                    Ok(planet_id)
+                }
+                other => Err(other),
+            })?;
             pending_planets.remove(&planet_id);
         }
 
@@ -243,6 +246,10 @@ impl OrchestratorApi {
     ///
     /// # Errors
     /// [`OrchestratorError::PlanetNotFound`] or [`OrchestratorError::ChannelError`].
+    ///
+    /// # Panics
+    /// If an internal registry mutex is poisoned (a prior panic occurred while
+    /// another thread held the lock).
     pub fn send_sunray(&self, planet_id: ID) -> Result<(), OrchestratorError> {
         let sunray = {
             let forge = self.forge.lock().unwrap();
@@ -300,6 +307,10 @@ impl OrchestratorApi {
     ///
     /// # Errors
     /// [`OrchestratorError::PlanetNotFound`] or [`OrchestratorError::ChannelError`].
+    ///
+    /// # Panics
+    /// If an internal registry mutex is poisoned (a prior panic occurred while
+    /// another thread held the lock).
     pub fn send_asteroid(&mut self, planet_id: ID) -> Result<bool, OrchestratorError> {
         let asteroid = {
             let forge = self.forge.lock().unwrap();
@@ -328,16 +339,27 @@ impl OrchestratorApi {
                 API_TIMEOUT,
                 &format!("AsteroidAck from planet {planet_id}"),
                 |msg| match msg {
-                    PlanetToOrchestrator::AsteroidAck { planet_id: id, rocket } if id == planet_id => {
-                        Ok(rocket)
-                    }
+                    PlanetToOrchestrator::AsteroidAck {
+                        planet_id: id,
+                        rocket,
+                    } if id == planet_id => Ok(rocket),
                     other => Err(other),
                 },
             )?
         };
 
         let survived = rocket.is_some();
-        if !survived {
+        if survived {
+            self.prob_registry.lock().unwrap().record_event(
+                crate::probability::OrchestratorEvent::AsteroidDeflected { planet_id },
+            );
+            // "Infiltrating the orchestrator's mind" — a manual asteroid nudges
+            // the whole galaxy's mood toward hostility, not just this planet.
+            self.prob_registry
+                .lock()
+                .unwrap()
+                .nudge_hostility(crate::probability::MANUAL_OVERRIDE_NUDGE);
+        } else {
             log::warn!("Planet {planet_id} destroyed by manual asteroid");
             let mut planets = self.planets.lock().unwrap();
             let mut topo = self.topology.lock().unwrap();
@@ -352,17 +374,6 @@ impl OrchestratorApi {
                 &mut rand::rng(),
             )?;
             // destroy_planet already dampened hostility above; no extra nudge needed.
-        } else {
-            self.prob_registry
-                .lock()
-                .unwrap()
-                .record_event(crate::probability::OrchestratorEvent::AsteroidDeflected { planet_id });
-            // "Infiltrating the orchestrator's mind" — a manual asteroid nudges
-            // the whole galaxy's mood toward hostility, not just this planet.
-            self.prob_registry
-                .lock()
-                .unwrap()
-                .nudge_hostility(crate::probability::MANUAL_OVERRIDE_NUDGE);
         }
         Ok(survived)
     }
@@ -373,7 +384,15 @@ impl OrchestratorApi {
     ///
     /// # Errors
     /// See [`crate::routing::move_explorer`].
-    pub fn move_explorer(&self, explorer_id: ID, dst_planet_id: ID) -> Result<(), OrchestratorError> {
+    ///
+    /// # Panics
+    /// If an internal registry mutex is poisoned (a prior panic occurred while
+    /// another thread held the lock).
+    pub fn move_explorer(
+        &self,
+        explorer_id: ID,
+        dst_planet_id: ID,
+    ) -> Result<(), OrchestratorError> {
         // find where the explorer currently is
         let current_planet_id = {
             let explorers = self.explorers.lock().unwrap();
@@ -385,7 +404,7 @@ impl OrchestratorApi {
 
         // lock both receivers before calling execute, which needs raw references
         let planet_rx = self.planet_rx.lock().unwrap();
-        let explorer_rx = self.explorer_rx.lock().unwrap();
+        let _explorer_rx = self.explorer_rx.lock().unwrap();
 
         crate::routing::move_explorer::execute(
             explorer_id,
@@ -404,6 +423,10 @@ impl OrchestratorApi {
     ///
     /// # Errors
     /// See channel errors.
+    ///
+    /// # Panics
+    /// If an internal registry mutex is poisoned (a prior panic occurred while
+    /// another thread held the lock).
     pub fn generate_resource(
         &self,
         explorer_id: ID,
@@ -442,6 +465,10 @@ impl OrchestratorApi {
     ///
     /// # Errors
     /// See channel errors.
+    ///
+    /// # Panics
+    /// If an internal registry mutex is poisoned (a prior panic occurred while
+    /// another thread held the lock).
     pub fn combine_resource(
         &self,
         explorer_id: ID,
@@ -482,6 +509,10 @@ impl OrchestratorApi {
     ///
     /// # Errors
     /// [`OrchestratorError::PlanetNotFound`] or channel error.
+    ///
+    /// # Panics
+    /// If an internal registry mutex is poisoned (a prior panic occurred while
+    /// another thread held the lock).
     pub fn planet_state(&self, planet_id: ID) -> Result<DummyPlanetState, OrchestratorError> {
         {
             let planets = self.planets.lock().unwrap();
@@ -508,6 +539,14 @@ impl OrchestratorApi {
     }
 
     /// Returns the IDs of neighbors of `planet_id`.
+    ///
+    /// # Errors
+    /// [`OrchestratorError::PlanetNotFound`] if `planet_id` does not exist (or
+    /// no longer exists, having been destroyed).
+    ///
+    /// # Panics
+    /// If the topology mutex is poisoned (a prior panic occurred while another
+    /// thread held the lock).
     pub fn neighbors(&self, planet_id: ID) -> Result<Vec<ID>, OrchestratorError> {
         let topo = self.topology.lock().unwrap();
         if !topo.contains(planet_id) {
@@ -517,6 +556,11 @@ impl OrchestratorApi {
     }
 
     /// Returns the IDs of all currently alive planets.
+    ///
+    /// # Panics
+    /// If the topology mutex is poisoned (a prior panic occurred while another
+    /// thread held the lock).
+    #[must_use]
     pub fn alive_planets(&self) -> Vec<ID> {
         self.topology.lock().unwrap().planet_ids().collect()
     }
@@ -525,11 +569,19 @@ impl OrchestratorApi {
     /// `[0.0, 1.0]`), bypassing the normal sunray/asteroid-driven climb.
     /// Lets the GUI verify the Eclipse/Solace flip instantly instead of
     /// waiting through many real death cycles.
+    ///
+    /// # Panics
+    /// If the probability registry mutex is poisoned (a prior panic occurred
+    /// while another thread held the lock).
     pub fn debug_nudge_hostility(&self, delta: f64) {
         self.prob_registry.lock().unwrap().nudge_hostility(delta);
     }
 
     /// Gracefully shuts down all threads: stops logic, kills all planets and explorers.
+    ///
+    /// # Panics
+    /// If an internal registry mutex is poisoned (a prior panic occurred while
+    /// another thread held the lock).
     pub fn shutdown(&mut self) {
         if self.logic.is_running() {
             let _ = self.logic.stop();
@@ -538,7 +590,10 @@ impl OrchestratorApi {
         // Kill all planets
         let planet_ids: Vec<_> = {
             let planets = self.planets.lock().unwrap();
-            planets.iter().map(|h| h.id()).collect()
+            planets
+                .iter()
+                .map(super::planet::handle::PlanetHandle::id)
+                .collect()
         };
         for id in planet_ids {
             let mut planets = self.planets.lock().unwrap();
@@ -553,7 +608,10 @@ impl OrchestratorApi {
         // Kill all explorers
         let explorer_ids: Vec<_> = {
             let explorers = self.explorers.lock().unwrap();
-            explorers.iter().map(|h| h.id()).collect()
+            explorers
+                .iter()
+                .map(super::explorer::handle::ExplorerHandle::id)
+                .collect()
         };
         for id in explorer_ids {
             let mut explorers = self.explorers.lock().unwrap();
@@ -572,6 +630,10 @@ impl OrchestratorApi {
     ///
     /// # Errors
     /// [`OrchestratorError::ExplorerNotFound`] or channel error.
+    ///
+    /// # Panics
+    /// If the explorer registry mutex is poisoned (a prior panic occurred while
+    /// another thread held the lock).
     pub fn bag_content(
         &self,
         explorer_id: ID,

@@ -21,6 +21,7 @@ pub struct PlanetRegistry {
 
 impl PlanetRegistry {
     /// Creates an empty registry.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             handles: HashMap::new(),
@@ -33,6 +34,7 @@ impl PlanetRegistry {
     }
 
     /// Returns an immutable reference to the handle for `planet_id`.
+    #[must_use]
     pub fn get(&self, planet_id: ID) -> Option<&PlanetHandle> {
         self.handles.get(&planet_id)
     }
@@ -48,6 +50,7 @@ impl PlanetRegistry {
     }
 
     /// Returns the number of alive planets.
+    #[must_use]
     pub fn count(&self) -> usize {
         self.handles.len()
     }
