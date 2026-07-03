@@ -24,14 +24,28 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 use std::collections::HashMap;
 
-/// Rate at which `hostility` climbs, tuned so a full 0.0 -> 1.0 ramp takes
-/// about 480 seconds (8 minutes) of wall-clock time, against a ~10-minute
-/// target full-game length — so hostility isn't already maxed a quarter of
-/// the way in. History: 1/60 (60s) -> 1/240 (4 min) -> 1/480 (8 min).
-const HOSTILITY_PER_SEC: f64 = 1.0 / 480.0;
+/// Rate at which `hostility` climbs. The 480s (8-minute) ramp assumed a
+/// ~10-minute target full-game length, but real playtests (this project's
+/// own logs) show games actually ending via total galaxy wipeout in about
+/// 2-4 minutes — meaning a natural, un-forced climb to the 0.5 Eclipse
+/// threshold (`HOSTILITY_PER_SEC * elapsed_secs`, minus death relief) almost
+/// never had enough real time to get there before the game was already over.
+/// That's the actual mechanism behind "Eclipse never triggers on her own" —
+/// not a bug, a pacing mismatch between the ramp and the real game length.
+/// Reverted to 240s (4 minutes), the historical middle value, so a full
+/// climb fits inside an actual game's real lifespan. History: 1/60 (60s) ->
+/// 1/240 (4 min) -> 1/480 (8 min) -> 1/240 (4 min, this fix).
+const HOSTILITY_PER_SEC: f64 = 1.0 / 240.0;
 
 /// How much a single manual sunray/asteroid override shifts `hostility`.
 pub const MANUAL_OVERRIDE_NUDGE: f64 = 0.075;
+
+/// Flat hostility relief granted on every planet death (see
+/// `on_planet_death` for why this replaced a multiplicative retention).
+/// Set just under `HOSTILITY_PER_SEC * 25.0` (one `TICK_INTERVAL`'s worth of
+/// climb), so even the fastest possible death cadence still nets a small
+/// positive drift toward the Eclipse threshold over time.
+const HOSTILITY_DEATH_RELIEF: f64 = 0.04;
 
 /// Number of ticks, at game start only, where every planet is forced to
 /// receive a sunray regardless of its curve or hostility. A planet that has
@@ -68,6 +82,7 @@ pub enum OrchestratorEvent {
     AsteroidDeflected { planet_id: ID },
     PlanetDestroyed   { planet_id: ID },
     ExplorerKilled    { explorer_id: ID },
+    ExplorerMoved     { explorer_id: ID, from: ID, to: ID },
 }
 
 /// Manages probability curves for all live planets.
@@ -139,21 +154,31 @@ impl ProbabilityRegistry {
     /// Called when a planet is destroyed. Dampens hostility (relief, not a
     /// full wipe) and re-shuffles curve assignments for variety.
     ///
-    /// Retention was 30%, which was still mathematically incapable of
-    /// reaching Eclipse: a real playtest log showed deaths ~90-100s apart.
-    /// With HOSTILITY_PER_SEC's 480s ramp, that's a climb of ~0.19 per cycle;
-    /// at 30% retention the steady-state ceiling solves to
-    /// `0.19 / (1 - 0.3) ≈ 0.27` — permanently below the 0.5 Eclipse
-    /// threshold, no matter how long the game runs. Raised to 65%, giving a
-    /// steady-state ceiling of `0.19 / (1 - 0.65) ≈ 0.54`, comfortably above
-    /// threshold while still cutting hostility by a third on every death.
+    /// Was a multiplicative 65% retention (`hostility *= 0.65`), tuned against
+    /// an assumed ~90-100s gap between deaths. Real playtests instead showed
+    /// deaths landing every 10-75s once the galaxy started dying off (the
+    /// one-death-per-tick cap still allows one every `TICK_INTERVAL` = 25s).
+    /// At that real cadence the multiplicative retention compounds hard —
+    /// three deaths 25s apart leave only `0.65^3 ≈ 27%` of any accumulated
+    /// hostility — so it was permanently crushing hostility back toward zero
+    /// and Eclipse effectively never triggered, which reads as Solace
+    /// dominating the whole game against her own character (she doesn't want
+    /// to be the one in control that long).
+    ///
+    /// Switched to a flat subtraction instead: `HOSTILITY_DEATH_RELIEF` is
+    /// chosen to be just under one tick's worth of climb
+    /// (`HOSTILITY_PER_SEC * TICK_INTERVAL ≈ 0.052`), so even worst-case
+    /// back-to-back-tick deaths leave a small net *positive* drift in
+    /// hostility instead of a guaranteed crush — hostility can still ratchet
+    /// up to the Eclipse threshold over a long enough game, while every death
+    /// still gives real, immediate relief.
     ///
     /// Deliberately does NOT reset the phase clock — only `hostility`. Each
     /// planet's own curve keeps running from wherever it was, so a death
     /// doesn't synchronize every survivor's wobble to the same instant.
     pub fn on_planet_death(&mut self, planet_id: ID, rng: &mut impl Rng) {
         self.assignments.remove(&planet_id);
-        self.hostility *= 0.65;
+        self.hostility = (self.hostility - HOSTILITY_DEATH_RELIEF).max(0.0);
 
         let surviving: Vec<ID> = self.assignments.keys().copied().collect();
         self.assignments = Self::shuffle_assignments(&surviving, rng);

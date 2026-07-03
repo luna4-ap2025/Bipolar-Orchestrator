@@ -422,22 +422,20 @@ impl OrchestratorApi {
 
         let rx = self.explorer_rx.lock().unwrap();
 
-        match rx.recv_timeout(API_TIMEOUT) {
-            Ok(ExplorerToOrchestrator::GenerateResourceResponse {
-                   explorer_id: ack_id,
-                   generated,
-               }) if ack_id == explorer_id => {
-                generated.map_err(OrchestratorError::ChannelError)
-            }
+        let generated = recv_ack(
+            &rx,
+            API_TIMEOUT,
+            &format!("GenerateResourceResponse from explorer {explorer_id}"),
+            |msg| match msg {
+                ExplorerToOrchestrator::GenerateResourceResponse {
+                    explorer_id: ack_id,
+                    generated,
+                } if ack_id == explorer_id => Ok(generated),
+                other => Err(other),
+            },
+        )?;
 
-            Ok(other) => Err(OrchestratorError::ChannelError(format!(
-                "Expected GenerateResourceResponse from explorer {explorer_id}, got {other:?}"
-            ))),
-
-            Err(_) => Err(OrchestratorError::ChannelError(format!(
-                "Timeout waiting for GenerateResourceResponse from explorer {explorer_id}"
-            ))),
-        }
+        generated.map_err(OrchestratorError::ChannelError)
     }
 
     /// Asks `explorer_id` to combine two resources on its current planet.
@@ -462,22 +460,20 @@ impl OrchestratorApi {
 
         let rx = self.explorer_rx.lock().unwrap();
 
-        match rx.recv_timeout(API_TIMEOUT) {
-            Ok(ExplorerToOrchestrator::CombineResourceResponse {
-                   explorer_id: ack_id,
-                   generated,
-               }) if ack_id == explorer_id => {
-                generated.map_err(OrchestratorError::ChannelError)
-            }
+        let generated = recv_ack(
+            &rx,
+            API_TIMEOUT,
+            &format!("CombineResourceResponse from explorer {explorer_id}"),
+            |msg| match msg {
+                ExplorerToOrchestrator::CombineResourceResponse {
+                    explorer_id: ack_id,
+                    generated,
+                } if ack_id == explorer_id => Ok(generated),
+                other => Err(other),
+            },
+        )?;
 
-            Ok(other) => Err(OrchestratorError::ChannelError(format!(
-                "Expected CombineResourceResponse from explorer {explorer_id}, got {other:?}"
-            ))),
-
-            Err(_) => Err(OrchestratorError::ChannelError(format!(
-                "Timeout waiting for CombineResourceResponse from explorer {explorer_id}"
-            ))),
-        }
+        generated.map_err(OrchestratorError::ChannelError)
     }
 
     /// Returns the internal state of `planet_id` (energy cells, rocket status).
@@ -498,17 +494,17 @@ impl OrchestratorApi {
         }
 
         let rx = self.planet_rx.lock().unwrap();
-        match rx.recv_timeout(API_TIMEOUT) {
-            Ok(PlanetToOrchestrator::InternalStateResponse { planet_state, .. }) => {
-                Ok(planet_state)
-            }
-            Ok(other) => Err(OrchestratorError::ChannelError(format!(
-                "Expected InternalStateResponse, got {other:?}"
-            ))),
-            Err(_) => Err(OrchestratorError::ChannelError(format!(
-                "Timeout waiting for InternalStateResponse from planet {planet_id}"
-            ))),
-        }
+        recv_ack(
+            &rx,
+            API_TIMEOUT,
+            &format!("InternalStateResponse from planet {planet_id}"),
+            |msg| match msg {
+                PlanetToOrchestrator::InternalStateResponse { planet_state, .. } => {
+                    Ok(planet_state)
+                }
+                other => Err(other),
+            },
+        )
     }
 
     /// Returns the IDs of neighbors of `planet_id`.
@@ -592,19 +588,17 @@ impl OrchestratorApi {
 
         let rx = self.explorer_rx.lock().unwrap();
 
-        match rx.recv_timeout(API_TIMEOUT) {
-            Ok(ExplorerToOrchestrator::BagContentResponse {
-                   explorer_id: ack_id,
-                   bag_content,
-               }) if ack_id == explorer_id => Ok(bag_content),
-
-            Ok(other) => Err(OrchestratorError::ChannelError(format!(
-                "Expected BagContentResponse from explorer {explorer_id}, got {other:?}"
-            ))),
-
-            Err(_) => Err(OrchestratorError::ChannelError(format!(
-                "Timeout waiting for BagContentResponse from explorer {explorer_id}"
-            ))),
-        }
+        recv_ack(
+            &rx,
+            API_TIMEOUT,
+            &format!("BagContentResponse from explorer {explorer_id}"),
+            |msg| match msg {
+                ExplorerToOrchestrator::BagContentResponse {
+                    explorer_id: ack_id,
+                    bag_content,
+                } if ack_id == explorer_id => Ok(bag_content),
+                other => Err(other),
+            },
+        )
     }
 }

@@ -2,7 +2,7 @@ use bevy::prelude::*;
 use bevy::asset::RenderAssetUsages;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::window::{CursorOptions, PrimaryWindow, WindowResolution};
-use bipolar_shared::{GalaxyEvent, GalaxySnapshot, Personality};
+use bipolar_shared::{GalaxyEvent, GalaxySnapshot, Personality, ResourceKind};
 use crossbeam_channel::{Receiver as CmdReceiver, Sender as CmdSender};
 use rand::RngExt;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -198,10 +198,13 @@ const SOLACE_INNER_SIZE: f32 = 84.0 * DISPLAY_SCALE;
 const ECLIPSE_INNER_SIZE: f32 = 96.0 * DISPLAY_SCALE;
 
 /// The stance sprite is a standing full-body figure for whichever personality
-/// currently controls the shared body — rendered at the same box size as the
-/// portrait bubbles, directly beneath them (Solace's stays on the left,
-/// Eclipse's on the right, matching each one's portrait).
-const STANCE_SIZE: f32 = PORTRAIT_BUBBLE_SIZE;
+/// currently controls the shared body. Unlike the portrait bubbles (a
+/// close-up on her current mood, tucked in the corner), the stance is how
+/// she's actually present in front of the galaxy — a large watching figure
+/// flanking the viewport, not a UI readout. Sized well above the portrait
+/// bubble but capped short of "overpowering": about a third of the
+/// viewport's height.
+const STANCE_SIZE: f32 = 240.0 * DISPLAY_SCALE;
 
 #[derive(Component)]
 struct TopBarPersonalityText;
@@ -277,6 +280,54 @@ fn format_mmss(seconds: f64) -> String {
     format!("{:02}:{:02}", total / 60, total % 60)
 }
 
+// ── Map hologram ────────────────────────────────────────────────────────────
+//
+// A toggleable overview panel (compass button opens/closes it) showing the
+// real galaxy topology in miniature: one node per alive planet, dashed
+// connection art between real neighbor pairs (same adjacency `draw_connections`
+// already draws in the main view), plus the current phase/personality —
+// all read from the same `GalaxyState` the rest of the GUI uses, nothing new
+// simulated just for this panel.
+
+/// Toggled by the compass button; drives the panel's visibility.
+#[derive(Resource, Default)]
+struct MapHologramOpen(bool);
+
+#[derive(Component)]
+struct CompassButtonTag;
+
+#[derive(Component)]
+struct MapHologramPanel;
+
+#[derive(Component)]
+struct MapNodeTag(u32);
+
+/// Index into `CONNECTIONS` — both ends' planet ids are derived from it when
+/// deciding whether this edge is still visible.
+#[derive(Component)]
+struct MapEdgeTag(usize);
+
+#[derive(Component)]
+struct MapClockText;
+
+const MAP_PANEL_W: f32 = 480.0 * DISPLAY_SCALE;
+const MAP_PANEL_H: f32 = 384.0 * DISPLAY_SCALE;
+const MAP_RING_RADIUS_X: f32 = 150.0 * DISPLAY_SCALE;
+const MAP_RING_RADIUS_Y: f32 = 100.0 * DISPLAY_SCALE;
+/// Local (top-left-origin, y-down) center of the mini ring within the panel —
+/// offset down from the panel's geometric center to leave room for the
+/// clock/phase readout at the top.
+const MAP_RING_CENTER: Vec2 = Vec2::new(MAP_PANEL_W / 2.0, MAP_PANEL_H / 2.0 + 30.0 * DISPLAY_SCALE);
+const MAP_NODE_SIZE: f32 = 28.0 * DISPLAY_SCALE;
+const MAP_EDGE_THICKNESS: f32 = 6.0 * DISPLAY_SCALE;
+
+/// Same elliptical-ring layout as `planet_position`, but in UI-local
+/// (y-down) space sized to fit inside the map panel.
+fn map_node_local_pos(index: usize) -> Vec2 {
+    let angle = FRAC_PI_2 - index as f32 * 2.0 * PI / 7.0;
+    MAP_RING_CENTER + Vec2::new(MAP_RING_RADIUS_X * angle.cos(), -MAP_RING_RADIUS_Y * angle.sin())
+}
+
 // ── Embedded galaxy config ────────────────────────────────────────────────────
 
 const GALAXY_SRC: &str = include_str!("../../galaxy.txt");
@@ -346,6 +397,9 @@ struct LiveSnapshot(Arc<Mutex<Option<GalaxySnapshot>>>);
 struct GalaxyState {
     alive: HashSet<u32>,
     explorer_planet: HashMap<u32, u32>,
+    /// Real bag content per explorer, fetched live from the explorer thread
+    /// each snapshot poll (`OrchestratorApi::bag_content`) — not GUI-guessed.
+    explorer_bag: HashMap<u32, Vec<(ResourceKind, usize)>>,
     /// Real, live adjacency from the backend topology — replaces the old
     /// hardcoded ring, which never reflected planets dying.
     neighbors: HashMap<u32, Vec<u32>>,
@@ -375,6 +429,86 @@ struct GlitchOverlay {
 }
 
 const GLITCH_DURATION_SECS: f32 = 1.2;
+
+/// How suspicious each personality is of the player, as a discrete tier: 0 =
+/// calm, 1 = confused, 2 = suspicious. Driven entirely by real manual
+/// overrides (the same "infiltration" moments that already trigger
+/// `GlitchQueue`) via `apply_manual_override` — not a fabricated stat, and
+/// not a continuously-decaying meter either: each personality has a
+/// preferred action (Solace: Sunray, Eclipse: Asteroid). An override that
+/// matches her own preference only ever nudges her to "confused" — she isn't
+/// against it, just puzzled she didn't choose to act. An override AGAINST
+/// her preference escalates one tier per occurrence; the third one is a
+/// refusal — the request is blocked outright and the tier resets to 0,
+/// exactly like the pressure "resolved itself" for her.
+#[derive(Resource, Default)]
+struct SuspicionState {
+    solace_tier: u8,
+    eclipse_tier: u8,
+}
+
+impl SuspicionState {
+    fn tier(&self, p: &Personality) -> u8 {
+        match p {
+            Personality::Solace => self.solace_tier,
+            Personality::Eclipse => self.eclipse_tier,
+        }
+    }
+
+    fn tier_mut(&mut self, p: &Personality) -> &mut u8 {
+        match p {
+            Personality::Solace => &mut self.solace_tier,
+            Personality::Eclipse => &mut self.eclipse_tier,
+        }
+    }
+}
+
+/// Highest resting tier (2 = suspicious); tier 3 (refusal) is instantaneous —
+/// it blocks the action and immediately resets to 0, so it's never a resting
+/// state the meter needs to render.
+const SUSPICION_MAX_RESTING_TIER: u8 = 2;
+
+enum SuspicionOutcome {
+    /// The request goes through. `reaction` is the portrait animation tag to
+    /// queue, if any (only fires the moment a tier is first reached).
+    Allowed { reaction: Option<&'static str> },
+    /// The third against-preference override in a row: blocked outright.
+    Refused,
+}
+
+/// Applies one manual Sunray/Asteroid override to `personality`'s suspicion
+/// tier and decides whether the request is allowed through.
+fn apply_manual_override(state: &mut SuspicionState, personality: &Personality, sunray: bool) -> SuspicionOutcome {
+    let preferred = match personality {
+        Personality::Solace => sunray,
+        Personality::Eclipse => !sunray,
+    };
+    let tier = state.tier_mut(personality);
+    if preferred {
+        let was_calm = *tier == 0;
+        *tier = (*tier).max(1);
+        SuspicionOutcome::Allowed { reaction: if was_calm { Some("confused") } else { None } }
+    } else if *tier >= SUSPICION_MAX_RESTING_TIER {
+        *tier = 0;
+        SuspicionOutcome::Refused
+    } else {
+        *tier += 1;
+        let reaction = if *tier == 1 { "confused" } else { "suspicious" };
+        SuspicionOutcome::Allowed { reaction: Some(reaction) }
+    }
+}
+
+/// Marks a suspicion meter's fill bar, bottom-anchored, height driven by the
+/// matching personality's live suspicion tier.
+#[derive(Component)]
+struct SuspicionMeterFill(Personality);
+
+/// Top-anchored at the same level as the portrait bubble (see
+/// `spawn_suspicion_meter` call sites) — the top position is fixed, so the
+/// bar's bottom edge is what moves when its size changes.
+const SUSPICION_METER_W: f32 = 30.0 * DISPLAY_SCALE;
+const SUSPICION_METER_H: f32 = 88.0 * DISPLAY_SCALE;
+const SUSPICION_FILL_INSET: f32 = 3.0 * DISPLAY_SCALE;
 
 // ── ECS components ─────────────────────────────────────────────────────────────
 
@@ -415,25 +549,66 @@ enum PlanetState {
 #[derive(Component)]
 struct ExplorerTag(u32);
 
+/// Loaded once at startup: one icon texture per real carried-resource kind.
+#[derive(Resource)]
+struct ResourceIcons(HashMap<ResourceKind, Handle<Image>>);
+
+impl ResourceIcons {
+    fn load(asset_server: &AssetServer) -> Self {
+        use ResourceKind::*;
+        let pairs = [
+            (Oxygen, "resource_oxygen.png"),
+            (Hydrogen, "resource_hydrogen.png"),
+            (Carbon, "resource_carbon.png"),
+            (Silicon, "resource_silicon.png"),
+            (Diamond, "resource_diamond.png"),
+            (Water, "resource_water.png"),
+            (Life, "resource_life.png"),
+            (Robot, "resource_robot.png"),
+            (Dolphin, "resource_dolphin.png"),
+        ];
+        Self(pairs.into_iter().map(|(k, f)| (k, asset_server.load(f))).collect())
+    }
+}
+
+/// How many carried-resource icons to show at once above an explorer's
+/// sprite. `slot` indexes into that explorer's real bag content; slots past
+/// the end of the bag are simply hidden.
+const RESOURCE_BADGE_SLOTS: usize = 3;
+
+#[derive(Component)]
+struct ResourceBadge {
+    explorer_id: u32,
+    slot: usize,
+}
+
 #[derive(PartialEq)]
 enum ExplorerPhase {
     Settled,
     Departing,
     Moving,
     Arrived,
+    /// One-shot "react_other" — played when this explorer notices it's sharing
+    /// a planet with the other explorer. They can't actually communicate, so
+    /// this is a GUI-only flourish reacting to real, shared position data.
+    ReactingOther,
 }
+
+const CO_REACT_HOLD_SECS: f32 = 1.0;
 
 /// Per-explorer movement + animation state machine.
 /// Explorers do NOT use AnimationConfig — this owns all their animation state.
 #[derive(Component)]
 struct ExplorerAnim {
-    // Frame ranges (inclusive).
+    // Frame ranges (inclusive), all read from this explorer's own Aseprite
+    // JSON export (jeb.json / viviana.json) rather than hand-copied.
     moving_range: (usize, usize),
     arrived_range: (usize, usize),
     departing_range: (usize, usize),
-    // The "settled" range is what plays when the explorer is resting on a planet.
-    // Viviana: collecting (16-19). Jeb: idle (0-3).
+    // The "settled" range is what plays when the explorer is resting on a
+    // planet. Viviana: collecting. Jeb: idle.
     settled_range: (usize, usize),
+    react_other_range: (usize, usize),
     fps: f32,
     anim_timer: Timer,
     // Movement state.
@@ -444,16 +619,32 @@ struct ExplorerAnim {
     move_t: f32,
     phase: ExplorerPhase,
     phase_timer: Timer,
+    /// Whether this explorer was sharing a planet with another explorer as of
+    /// the last check. Edge-triggered: react_other fires the instant this
+    /// flips false -> true (checked every frame against real backend
+    /// positions, not sampled periodically), and resets to false as soon as
+    /// this explorer leaves the planet, so two explorers get a fresh "oh, you
+    /// again" every time their paths actually cross rather than once per
+    /// fixed interval.
+    was_co_located: bool,
+    /// Real hops (destination planet ids), one per confirmed `ExplorerMoved`
+    /// event, in the order the backend actually reported them. Consumed one
+    /// at a time from `Settled`/`ReactingOther` — this is what guarantees a
+    /// burst of several real moves landing between two ~250ms snapshot polls
+    /// still gets animated through every intermediate planet, in order,
+    /// instead of only ever showing wherever the explorer most recently was.
+    pending_hops: VecDeque<u32>,
 }
 
 impl ExplorerAnim {
-    fn new_viviana(start_planet: u32) -> Self {
+    fn new_viviana(start_planet: u32, tags: &AnimTags) -> Self {
         let pos = explorer_offset_pos(start_planet, 1);
         Self {
-            moving_range:    (4, 7),
-            arrived_range:   (8, 11),
-            departing_range: (12, 15),
-            settled_range:   (16, 19),
+            moving_range:      tags.viviana("moving"),
+            arrived_range:     tags.viviana("arrived"),
+            departing_range:   tags.viviana("departing"),
+            settled_range:     tags.viviana("collecting"),
+            react_other_range: tags.viviana("react_other"),
             fps: 5.0,
             anim_timer: Timer::from_seconds(1.0 / 5.0, TimerMode::Repeating),
             cur_planet: start_planet,
@@ -463,16 +654,19 @@ impl ExplorerAnim {
             move_t: 0.0,
             phase: ExplorerPhase::Settled,
             phase_timer: Timer::from_seconds(0.8, TimerMode::Once),
+            was_co_located: false,
+            pending_hops: VecDeque::new(),
         }
     }
 
-    fn new_jeb(start_planet: u32) -> Self {
+    fn new_jeb(start_planet: u32, tags: &AnimTags) -> Self {
         let pos = explorer_offset_pos(start_planet, 2);
         Self {
-            moving_range:    (4, 6),
-            arrived_range:   (7, 10),
-            departing_range: (11, 13),
-            settled_range:   (0, 3),
+            moving_range:      tags.jeb("moving"),
+            arrived_range:     tags.jeb("arrived"),
+            departing_range:   tags.jeb("departing"),
+            settled_range:     tags.jeb("idle"),
+            react_other_range: tags.jeb("react_other"),
             fps: 5.0,
             anim_timer: Timer::from_seconds(1.0 / 5.0, TimerMode::Repeating),
             cur_planet: start_planet,
@@ -482,6 +676,8 @@ impl ExplorerAnim {
             move_t: 0.0,
             phase: ExplorerPhase::Settled,
             phase_timer: Timer::from_seconds(0.8, TimerMode::Once),
+            was_co_located: false,
+            pending_hops: VecDeque::new(),
         }
     }
 }
@@ -585,10 +781,19 @@ struct AsepriteExport {
 struct AnimTags {
     solace: HashMap<String, (usize, usize)>,
     eclipse: HashMap<String, (usize, usize)>,
+    solace_stance: HashMap<String, (usize, usize)>,
+    eclipse_stance: HashMap<String, (usize, usize)>,
+    jeb: HashMap<String, (usize, usize)>,
+    viviana: HashMap<String, (usize, usize)>,
+    /// All 7 `planet_*.json` exports share identical tag names/ranges
+    /// (checked directly: idle/hit/receive/dying/destroyed are byte-for-byte
+    /// the same across every planet type) — one shared map covers all of them,
+    /// no per-planet-type lookup needed.
+    planet: HashMap<String, (usize, usize)>,
 }
 
 impl AnimTags {
-    /// Reads `solace.json`/`eclipse.json` straight from the assets folder —
+    /// Reads every sheet's `.json` export straight from the assets folder —
     /// the same folder Bevy's own asset server resolves `asset_server.load`
     /// paths against (`CARGO_MANIFEST_DIR`/assets in dev builds), so this
     /// stays in lockstep with whatever sheet is actually being rendered.
@@ -596,6 +801,11 @@ impl AnimTags {
         Self {
             solace: Self::load_one("solace.json"),
             eclipse: Self::load_one("eclipse.json"),
+            solace_stance: Self::load_one("solace_stance.json"),
+            eclipse_stance: Self::load_one("eclipse_stance.json"),
+            jeb: Self::load_one("jeb.json"),
+            viviana: Self::load_one("viviana.json"),
+            planet: Self::load_one("planet_orbitron.json"),
         }
     }
 
@@ -608,16 +818,44 @@ impl AnimTags {
         export.meta.frame_tags.into_iter().map(|t| (t.name, (t.from, t.to))).collect()
     }
 
-    /// Frame range for a named tag on `personality`'s sheet. Panics on an
-    /// unrecognized tag — a typo here should fail loudly at startup instead
-    /// of silently playing nothing (or the wrong frames).
+    /// Frame range for a named tag on `personality`'s portrait sheet. Panics
+    /// on an unrecognized tag — a typo here should fail loudly at startup
+    /// instead of silently playing nothing (or the wrong frames).
     fn get(&self, personality: &Personality, tag: &str) -> (usize, usize) {
         let map = match personality {
             Personality::Solace => &self.solace,
             Personality::Eclipse => &self.eclipse,
         };
+        Self::lookup(map, tag, "solace.json/eclipse.json")
+    }
+
+    /// Frame range for a named tag on `personality`'s stance sheet.
+    fn stance(&self, personality: &Personality, tag: &str) -> (usize, usize) {
+        let map = match personality {
+            Personality::Solace => &self.solace_stance,
+            Personality::Eclipse => &self.eclipse_stance,
+        };
+        Self::lookup(map, tag, "solace_stance.json/eclipse_stance.json")
+    }
+
+    /// Frame range for a named tag on Jeb's sheet (`jeb.json`).
+    fn jeb(&self, tag: &str) -> (usize, usize) {
+        Self::lookup(&self.jeb, tag, "jeb.json")
+    }
+
+    /// Frame range for a named tag on Viviana's sheet (`viviana.json`).
+    fn viviana(&self, tag: &str) -> (usize, usize) {
+        Self::lookup(&self.viviana, tag, "viviana.json")
+    }
+
+    /// Frame range for a named tag shared by every planet sheet.
+    fn planet(&self, tag: &str) -> (usize, usize) {
+        Self::lookup(&self.planet, tag, "planet_*.json")
+    }
+
+    fn lookup(map: &HashMap<String, (usize, usize)>, tag: &str, source: &str) -> (usize, usize) {
         *map.get(tag)
-            .unwrap_or_else(|| panic!("unknown animation tag {tag:?} for {personality:?} — check solace.json/eclipse.json's frameTags"))
+            .unwrap_or_else(|| panic!("unknown animation tag {tag:?} — check {source}'s frameTags"))
     }
 }
 
@@ -665,12 +903,14 @@ struct StanceTag(Personality);
 /// events or plays one-shots — it just idles forever while visible.
 #[derive(Component)]
 struct StanceAnim {
+    first: usize,
+    last: usize,
     timer: Timer,
 }
 
-impl Default for StanceAnim {
-    fn default() -> Self {
-        Self { timer: Timer::from_seconds(1.0 / 6.0, TimerMode::Repeating) }
+impl StanceAnim {
+    fn new(range: (usize, usize)) -> Self {
+        Self { first: range.0, last: range.1, timer: Timer::from_seconds(1.0 / 6.0, TimerMode::Repeating) }
     }
 }
 
@@ -715,8 +955,12 @@ struct CursorTag;
 
 // ── Galaxy layout ─────────────────────────────────────────────────────────────
 
+// Mirrors the real topology in `galaxy.txt` — a circulant C7(1,2) graph
+// (distance-1 ring edges plus distance-2 cross-links), not the old plain
+// 7-edge ring.
 const CONNECTIONS: &[(usize, usize)] = &[
     (0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 0),
+    (0, 2), (1, 3), (2, 4), (3, 5), (4, 6), (5, 0), (6, 1),
 ];
 
 /// Elliptical, not circular — the viewport hole has much more horizontal
@@ -839,6 +1083,8 @@ fn main() {
         .insert_resource(LogicRunState::NotStarted)
         .insert_resource(ShootingStarTimer::default())
         .insert_resource(GlitchQueue::default())
+        .insert_resource(MapHologramOpen::default())
+        .insert_resource(SuspicionState::default())
         .insert_resource(ReadySignal(Some(ready_tx)))
         .add_systems(Startup, setup)
         .add_systems(
@@ -866,7 +1112,7 @@ fn main() {
                 cockpit_button_hover,
             ),
         )
-        .add_systems(Update, (sync_hologram_visibility, sync_hologram_content, sync_explorers, sync_action_buttons_enabled, sync_selection_validity, sync_stance_visibility, drive_stance_anim))
+        .add_systems(Update, (sync_hologram_visibility, sync_hologram_content, sync_explorers, sync_action_buttons_enabled, sync_selection_validity, sync_stance_visibility, drive_stance_anim, sync_resource_badges))
         .add_systems(
             Update,
             (
@@ -877,6 +1123,17 @@ fn main() {
                 spawn_shooting_stars,
                 drive_shooting_stars,
                 follow_cursor,
+            ),
+        )
+        .add_systems(
+            Update,
+            (
+                toggle_map_hologram,
+                sync_map_hologram_visibility,
+                sync_map_nodes,
+                sync_map_edges,
+                update_map_clock_text,
+                sync_suspicion_meter,
             ),
         )
         .run();
@@ -959,6 +1216,7 @@ fn poll_snapshot(
     mut state: ResMut<GalaxyState>,
     mut queue: ResMut<PortraitEventQueue>,
     mut planet_queue: ResMut<PlanetReactionQueue>,
+    mut explorer_anims: Query<(&ExplorerTag, &mut ExplorerAnim)>,
 ) {
     let Ok(mut guard) = live.0.try_lock() else { return };
     let Some(snap) = guard.as_mut() else { return };
@@ -1010,7 +1268,8 @@ fn poll_snapshot(
                         target: Personality::Solace, first, last, priority: false,
                     });
                 }
-                planet_queue.0.push_back(PlanetReaction { planet_id: *planet_id, first: 11, last: 13 });
+                let (first, last) = tags.planet("receive");
+                planet_queue.0.push_back(PlanetReaction { planet_id: *planet_id, first, last });
             }
             GalaxyEvent::AsteroidSent { .. } => {
                 // Solace's "unwanted_event" (guilty — she doesn't want to kill)
@@ -1035,15 +1294,30 @@ fn poll_snapshot(
                         target: Personality::Eclipse, first, last, priority: false,
                     });
                 }
-                planet_queue.0.push_back(PlanetReaction { planet_id: *planet_id, first: 8, last: 10 });
+                let (first, last) = tags.planet("hit");
+                planet_queue.0.push_back(PlanetReaction { planet_id: *planet_id, first, last });
             }
             GalaxyEvent::PlanetDestroyed { planet_id } => {
                 // Trigger the final hit visual; the personality flip handles portraits.
-                planet_queue.0.push_back(PlanetReaction { planet_id: *planet_id, first: 8, last: 10 });
+                let (first, last) = tags.planet("hit");
+                planet_queue.0.push_back(PlanetReaction { planet_id: *planet_id, first, last });
             }
             GalaxyEvent::ExplorerKilled { explorer_id } => {
                 // No dedicated visual yet — logged so it's visible during testing.
                 println!("[gui] Explorer {explorer_id} died with their planet");
+            }
+            GalaxyEvent::ExplorerMoved { explorer_id, to, .. } => {
+                // Queue the real hop rather than relying on the polled
+                // `explorer_planet` position diff — a burst of several real
+                // moves landing between two ~250ms snapshot polls would
+                // otherwise only ever show the *last* one, silently skipping
+                // every real intermediate planet. drive_explorers drains this
+                // queue one hop at a time, in order.
+                for (tag, mut ea) in &mut explorer_anims {
+                    if tag.0 == *explorer_id {
+                        ea.pending_hops.push_back(*to);
+                    }
+                }
             }
         }
     }
@@ -1051,6 +1325,7 @@ fn poll_snapshot(
     state.personality = new_personality;
     state.alive = snap.alive_planets.iter().copied().collect();
     state.explorer_planet = snap.explorers.iter().map(|e| (e.id, e.planet)).collect();
+    state.explorer_bag = snap.explorers.iter().map(|e| (e.id, e.bag.clone())).collect();
     state.neighbors = snap.neighbors.clone();
     state.hostility = snap.hostility;
     state.phase_elapsed = snap.phase_elapsed;
@@ -1099,6 +1374,61 @@ fn sync_explorers(
     }
 }
 
+/// Spawns the (initially hidden) resource-badge sprites for one explorer.
+/// Their image/position/visibility are all driven each frame by
+/// `sync_resource_badges` from the real bag content in `GalaxyState`.
+fn spawn_resource_badges(commands: &mut Commands, explorer_id: u32) {
+    for slot in 0..RESOURCE_BADGE_SLOTS {
+        commands.spawn((
+            Sprite {
+                custom_size: Some(Vec2::new(20.0, 20.0) * DISPLAY_SCALE),
+                ..default()
+            },
+            Transform::from_xyz(0.0, 0.0, 3.0),
+            Visibility::Hidden,
+            ResourceBadge { explorer_id, slot },
+        ));
+    }
+}
+
+/// Positions and shows/hides each carried-resource badge above its explorer,
+/// reading the real bag content fetched live from the explorer thread each
+/// snapshot poll. Runs after `drive_explorers` so badges follow the
+/// explorer's current (possibly mid-hop) position rather than lagging a
+/// frame behind.
+fn sync_resource_badges(
+    state: Res<GalaxyState>,
+    icons: Res<ResourceIcons>,
+    explorer_q: Query<(&ExplorerTag, &Transform), Without<ResourceBadge>>,
+    mut badge_q: Query<(&ResourceBadge, &mut Transform, &mut Sprite, &mut Visibility), Without<ExplorerTag>>,
+) {
+    let positions: HashMap<u32, Vec2> = explorer_q
+        .iter()
+        .map(|(tag, tf)| (tag.0, Vec2::new(tf.translation.x, tf.translation.y)))
+        .collect();
+
+    for (badge, mut tf, mut sprite, mut vis) in &mut badge_q {
+        let Some(&pos) = positions.get(&badge.explorer_id) else {
+            *vis = Visibility::Hidden;
+            continue;
+        };
+        let held = state
+            .explorer_bag
+            .get(&badge.explorer_id)
+            .and_then(|bag| bag.get(badge.slot));
+
+        match held {
+            Some(&(kind, _count)) => {
+                let x_offset = (badge.slot as f32 - (RESOURCE_BADGE_SLOTS as f32 - 1.0) / 2.0) * 22.0 * DISPLAY_SCALE;
+                tf.translation = Vec3::new(pos.x + x_offset, pos.y + 46.0 * DISPLAY_SCALE, 3.0);
+                sprite.image = icons.0[&kind].clone();
+                *vis = Visibility::Inherited;
+            }
+            None => *vis = Visibility::Hidden,
+        }
+    }
+}
+
 fn drive_explorers(
     state: Res<GalaxyState>,
     time: Res<Time>,
@@ -1110,11 +1440,62 @@ fn drive_explorers(
 
     let delta = time.delta();
 
+    // Snapshot every explorer's real backend planet up front so the
+    // co-location check below (used by react_other) can see the *other*
+    // explorer's position without a second, nested query over the same
+    // component set.
+    let backend_positions: Vec<(u32, u32)> = state.explorer_planet.iter().map(|(&id, &p)| (id, p)).collect();
+
     for (tag, mut tf, mut sprite, mut ea) in &mut query {
         ea.anim_timer.tick(delta);
         let tick = ea.anim_timer.just_finished();
 
-        let backend_planet = state.explorer_planet.get(&tag.0).copied();
+        // Only decide on a new destination while resting — a move already in
+        // flight finishes its own hop first, so real moves get replayed in
+        // order rather than a later one cutting an earlier one short.
+        let can_start_new_move = matches!(ea.phase, ExplorerPhase::Settled | ExplorerPhase::ReactingOther);
+
+        if can_start_new_move {
+            // Prefer a queued real hop (from a confirmed `ExplorerMoved`
+            // event) over the raw polled `explorer_planet` position: the
+            // queue preserves every hop in order even if several land between
+            // two ~250ms snapshot polls, where the polled position alone
+            // would only ever show the *last* one and silently skip the rest
+            // — which is exactly what read as "wrong planet, moving too
+            // fast". Falling back to the polled position keeps things working
+            // even if a move event was ever missed for some reason.
+            //
+            // A queued hop's planet can die *after* being queued but *before*
+            // the animation catches up to it (the queue can lag several real
+            // seconds behind during a burst) — animating a full walk to, and
+            // settling on, a planet whose sprite has since been hidden is
+            // exactly what read as "the explorer is standing in empty space."
+            // Skip any now-dead hops instantly (no wasted travel animation to
+            // a place that no longer visually exists) rather than visiting
+            // them.
+            let mut next = None;
+            while let Some(bp) = ea.pending_hops.pop_front() {
+                if state.alive.contains(&bp) {
+                    next = Some(bp);
+                    break;
+                }
+            }
+            let next = next
+                .or_else(|| state.explorer_planet.get(&tag.0).copied().filter(|&bp| bp != ea.cur_planet));
+
+            if let Some(bp) = next {
+                ea.target_planet = bp;
+                ea.to_pos = explorer_offset_pos(bp, tag.0);
+                ea.from_pos = Vec2::new(tf.translation.x, tf.translation.y);
+                ea.anim_timer = Timer::from_seconds(1.0 / ea.fps, TimerMode::Repeating);
+                ea.phase = ExplorerPhase::Departing;
+                ea.phase_timer = Timer::from_seconds(DEPART_HOLD, TimerMode::Once);
+                ea.was_co_located = false;
+                if let Some(atlas) = &mut sprite.texture_atlas {
+                    atlas.index = ea.departing_range.0;
+                }
+            }
+        }
 
         match ea.phase {
             ExplorerPhase::Settled => {
@@ -1124,18 +1505,46 @@ fn drive_explorers(
                         if atlas.index >= l { atlas.index = f; } else { atlas.index += 1; }
                     }
                 }
-                // Only react to a planet change when fully settled.
-                if let Some(bp) = backend_planet {
-                    if bp != ea.cur_planet {
-                        ea.target_planet = bp;
-                        ea.to_pos = explorer_offset_pos(bp, tag.0);
-                        ea.from_pos = Vec2::new(tf.translation.x, tf.translation.y);
-                        ea.phase = ExplorerPhase::Departing;
-                        ea.phase_timer = Timer::from_seconds(DEPART_HOLD, TimerMode::Once);
-                        ea.anim_timer = Timer::from_seconds(1.0 / ea.fps, TimerMode::Repeating);
-                        if let Some(atlas) = &mut sprite.texture_atlas {
-                            atlas.index = ea.departing_range.0;
-                        }
+                // Explorers can't actually talk to each other, but it's a fun
+                // touch to have them notice/react when they end up sharing a
+                // planet — checked every frame against the real backend
+                // positions of every other explorer, edge-triggered so it
+                // fires the instant paths cross rather than on a periodic
+                // sample that could miss a brief overlap.
+                // Compare this explorer's own *real* backend planet (not
+                // `ea.cur_planet`, which can lag several real hops behind
+                // during a burst — see `pending_hops`) against the other
+                // explorer's real backend planet. Comparing a possibly-stale
+                // local value against a live one was why this almost never
+                // fired even when the sprites visually looked adjacent.
+                let co_located = state
+                    .explorer_planet
+                    .get(&tag.0)
+                    .is_some_and(|&my_p| backend_positions.iter().any(|&(id, p)| id != tag.0 && p == my_p));
+                if co_located && !ea.was_co_located {
+                    ea.phase = ExplorerPhase::ReactingOther;
+                    ea.phase_timer = Timer::from_seconds(CO_REACT_HOLD_SECS, TimerMode::Once);
+                    ea.anim_timer = Timer::from_seconds(1.0 / ea.fps, TimerMode::Repeating);
+                    if let Some(atlas) = &mut sprite.texture_atlas {
+                        atlas.index = ea.react_other_range.0;
+                    }
+                }
+                ea.was_co_located = co_located;
+            }
+
+            ExplorerPhase::ReactingOther => {
+                if tick {
+                    if let Some(atlas) = &mut sprite.texture_atlas {
+                        let (f, l) = ea.react_other_range;
+                        if atlas.index >= l { atlas.index = f; } else { atlas.index += 1; }
+                    }
+                }
+                ea.phase_timer.tick(delta);
+                if ea.phase_timer.just_finished() {
+                    ea.phase = ExplorerPhase::Settled;
+                    ea.anim_timer = Timer::from_seconds(1.0 / ea.fps, TimerMode::Repeating);
+                    if let Some(atlas) = &mut sprite.texture_atlas {
+                        atlas.index = ea.settled_range.0;
                     }
                 }
             }
@@ -1208,6 +1617,7 @@ fn drive_explorers(
 /// Detects when a planet leaves alive_planets and triggers its death animation sequence.
 fn sync_planets(
     state: Res<GalaxyState>,
+    tags: Res<AnimTags>,
     mut query: Query<(
         &PlanetTag,
         &mut Visibility,
@@ -1229,16 +1639,18 @@ fn sync_planets(
                 if state.alive.contains(&tag.0) {
                     *vis = Visibility::Inherited;
                 } else {
-                    // Planet just died — start dying (14-19) then destroyed (20-27) then hide.
+                    // Planet just died — start dying, then destroyed, then hide.
+                    let dying = tags.planet("dying");
+                    let destroyed = tags.planet("destroyed");
                     *pstate = PlanetState::Dying;
-                    anim.first = 14;
-                    anim.last = 19;
+                    anim.first = dying.0;
+                    anim.last = dying.1;
                     anim.looping = false;
-                    anim.next_range = Some((20, 27));
+                    anim.next_range = Some(destroyed);
                     anim.pending_hide = true;
                     anim.timer = Timer::from_seconds(1.0 / 10.0, TimerMode::Repeating);
                     if let Some(atlas) = &mut sprite.texture_atlas {
-                        atlas.index = 14;
+                        atlas.index = dying.0;
                     }
                 }
             }
@@ -1251,6 +1663,7 @@ fn sync_planets(
 /// Drives all planet animations, including the two-phase death sequence.
 fn drive_planet_anim(
     time: Res<Time>,
+    tags: Res<AnimTags>,
     mut query: Query<(
         &mut Sprite,
         &mut AnimationConfig,
@@ -1276,11 +1689,12 @@ fn drive_planet_anim(
                     *vis = Visibility::Hidden;
                 } else if *state == PlanetState::Alive {
                     // One-shot reaction (hit/receive) finished — return to idle.
-                    anim.first = 0;
-                    anim.last = 7;
+                    let idle = tags.planet("idle");
+                    anim.first = idle.0;
+                    anim.last = idle.1;
                     anim.looping = true;
                     anim.timer = Timer::from_seconds(1.0 / 10.0, TimerMode::Repeating);
-                    atlas.index = 0;
+                    atlas.index = idle.0;
                 }
             } else {
                 atlas.index += 1;
@@ -1410,7 +1824,7 @@ fn drive_stance_anim(time: Res<Time>, mut query: Query<(&mut StanceAnim, &mut Im
         anim.timer.tick(time.delta());
         if anim.timer.just_finished() {
             if let Some(atlas) = &mut image.texture_atlas {
-                atlas.index = if atlas.index >= 3 { 0 } else { atlas.index + 1 };
+                atlas.index = if atlas.index >= anim.last { anim.first } else { atlas.index + 1 };
             }
         }
     }
@@ -1443,6 +1857,18 @@ fn drive_glitch_overlays(
         let fraction = overlay.remaining / GLITCH_DURATION_SECS;
         let flicker = ((elapsed * 45.0).sin().abs() * 0.5 + 0.5) as f32;
         image.color.set_alpha(fraction * flicker);
+    }
+}
+
+/// Fills each personality's suspicion meter to match their live tier.
+/// `apply_manual_override` (called directly from the Sunray/Asteroid button
+/// handlers) is what actually changes the tier and queues portrait
+/// reactions — this system just keeps the little side-stat bar in sync.
+fn sync_suspicion_meter(suspicion: Res<SuspicionState>, mut query: Query<(&SuspicionMeterFill, &mut Node)>) {
+    let max_h = SUSPICION_METER_H - SUSPICION_FILL_INSET * 2.0;
+    for (fill, mut node) in &mut query {
+        let frac = suspicion.tier(&fill.0) as f32 / SUSPICION_MAX_RESTING_TIER as f32;
+        node.height = Val::Px(max_h * frac);
     }
 }
 
@@ -1784,16 +2210,34 @@ fn fire_on_selected_planet(
     selection: &Selection,
     cmds: &UiCommands,
     glitch: &mut GlitchQueue,
+    suspicion: &mut SuspicionState,
+    tags: &AnimTags,
+    queue: &mut PortraitEventQueue,
     active: Personality,
     sunray: bool,
 ) {
     let Some(planet_id) = selection.planet else { return };
-    if sunray {
-        let _ = cmds.0.send(UiCommand::Sunray(planet_id));
-    } else {
-        let _ = cmds.0.send(UiCommand::Asteroid(planet_id));
+    glitch.0.push(active.clone());
+
+    match apply_manual_override(suspicion, &active, sunray) {
+        SuspicionOutcome::Allowed { reaction } => {
+            if sunray {
+                let _ = cmds.0.send(UiCommand::Sunray(planet_id));
+            } else {
+                let _ = cmds.0.send(UiCommand::Asteroid(planet_id));
+            }
+            if let Some(tag) = reaction {
+                let (first, last) = tags.get(&active, tag);
+                queue.0.push_back(PortraitReaction { target: active, first, last, priority: true });
+            }
+        }
+        // Refused: she notices the pattern and shuts it down — the request
+        // never reaches the orchestrator at all.
+        SuspicionOutcome::Refused => {
+            let (first, last) = tags.get(&active, "refusal");
+            queue.0.push_back(PortraitReaction { target: active, first, last, priority: true });
+        }
     }
-    glitch.0.push(active);
 }
 
 fn handle_sunray_button(
@@ -1802,10 +2246,13 @@ fn handle_sunray_button(
     state: Res<GalaxyState>,
     cmds: Res<UiCommands>,
     mut glitch: ResMut<GlitchQueue>,
+    mut suspicion: ResMut<SuspicionState>,
+    tags: Res<AnimTags>,
+    mut queue: ResMut<PortraitEventQueue>,
 ) {
     for interaction in &interaction_query {
         if *interaction == Interaction::Pressed {
-            fire_on_selected_planet(&selection, &cmds, &mut glitch, state.personality.clone(), true);
+            fire_on_selected_planet(&selection, &cmds, &mut glitch, &mut suspicion, &tags, &mut queue, state.personality.clone(), true);
         }
     }
 }
@@ -1816,10 +2263,13 @@ fn handle_asteroid_button(
     state: Res<GalaxyState>,
     cmds: Res<UiCommands>,
     mut glitch: ResMut<GlitchQueue>,
+    mut suspicion: ResMut<SuspicionState>,
+    tags: Res<AnimTags>,
+    mut queue: ResMut<PortraitEventQueue>,
 ) {
     for interaction in &interaction_query {
         if *interaction == Interaction::Pressed {
-            fire_on_selected_planet(&selection, &cmds, &mut glitch, state.personality.clone(), false);
+            fire_on_selected_planet(&selection, &cmds, &mut glitch, &mut suspicion, &tags, &mut queue, state.personality.clone(), false);
         }
     }
 }
@@ -1918,6 +2368,67 @@ fn sync_hologram_content(
             }
         }
     }
+}
+
+/// Toggles the map hologram open/closed when the compass button is pressed.
+fn toggle_map_hologram(
+    mut open: ResMut<MapHologramOpen>,
+    query: Query<&Interaction, (Changed<Interaction>, With<CompassButtonTag>)>,
+) {
+    for interaction in &query {
+        if *interaction == Interaction::Pressed {
+            open.0 = !open.0;
+        }
+    }
+}
+
+fn sync_map_hologram_visibility(
+    open: Res<MapHologramOpen>,
+    mut panel_q: Query<&mut Visibility, With<MapHologramPanel>>,
+) {
+    if !open.is_changed() {
+        return;
+    }
+    for mut vis in &mut panel_q {
+        *vis = if open.0 { Visibility::Visible } else { Visibility::Hidden };
+    }
+}
+
+/// Shows a node only while its planet is still alive — same real data
+/// `sync_planets` uses, just read here for the mini-map's own node icons.
+fn sync_map_nodes(state: Res<GalaxyState>, mut query: Query<(&MapNodeTag, &mut Visibility)>) {
+    if !state.ready {
+        return;
+    }
+    for (tag, mut vis) in &mut query {
+        *vis = if state.alive.contains(&tag.0) { Visibility::Inherited } else { Visibility::Hidden };
+    }
+}
+
+/// Shows an edge only while both its planets are still alive — mirrors
+/// `draw_connections`'s exact rule (and its "not ready yet, show everything"
+/// fallback before the first real snapshot arrives).
+fn sync_map_edges(state: Res<GalaxyState>, mut query: Query<(&MapEdgeTag, &mut Visibility)>) {
+    for (tag, mut vis) in &mut query {
+        let (a, b) = CONNECTIONS[tag.0];
+        let pid_a = (a + 1) as u32;
+        let pid_b = (b + 1) as u32;
+        let alive = state.alive.is_empty() || (state.alive.contains(&pid_a) && state.alive.contains(&pid_b));
+        *vis = if alive { Visibility::Inherited } else { Visibility::Hidden };
+    }
+}
+
+/// Mirrors `update_top_bar_personality`/`update_top_bar_cycle` into one line
+/// inside the map hologram panel.
+fn update_map_clock_text(state: Res<GalaxyState>, mut query: Query<(&mut Text, &mut TextColor), With<MapClockText>>) {
+    let Ok((mut text, mut color)) = query.single_mut() else { return };
+    let pct = (state.hostility * 100.0).round() as i32;
+    let (label, tint) = match state.personality {
+        Personality::Solace => ("SOLACE", SOLACE_GOLD),
+        Personality::Eclipse => ("ECLIPSE", ECLIPSE_PURPLE),
+    };
+    **text = format!("{label} ({pct}%) — {}", format_mmss(state.phase_elapsed));
+    color.0 = tint;
 }
 
 /// Simple hover feedback for cockpit buttons — brightens on hover, dims on
@@ -2046,6 +2557,7 @@ fn spawn_cockpit_ui(
     commands: &mut Commands,
     asset_server: &AssetServer,
     layouts: &mut Assets<TextureAtlasLayout>,
+    tags: &AnimTags,
 ) {
     let solace_layout = layouts.add(TextureAtlasLayout::from_grid(UVec2::new(128, 128), 37, 1, None, None));
     let eclipse_layout = layouts.add(TextureAtlasLayout::from_grid(UVec2::new(128, 128), 36, 1, None, None));
@@ -2142,6 +2654,7 @@ fn spawn_cockpit_ui(
             ));
 
             // ── Portrait bubbles — upper corners of the viewport ─────────────
+            let solace_idle = tags.get(&Personality::Solace, "idle");
             spawn_portrait_bubble(
                 root,
                 asset_server,
@@ -2150,10 +2663,11 @@ fn spawn_cockpit_ui(
                 "solace.png",
                 solace_layout,
                 SOLACE_INNER_SIZE,
-                PortraitConfig::new(0, 3, 10.0, 10.0 / 3.0),
+                PortraitConfig::new(solace_idle.0, solace_idle.1, 10.0, 10.0 / 3.0),
                 Personality::Solace,
                 "SOLACE",
             );
+            let eclipse_idle = tags.get(&Personality::Eclipse, "idle");
             spawn_portrait_bubble(
                 root,
                 asset_server,
@@ -2162,23 +2676,36 @@ fn spawn_cockpit_ui(
                 "eclipse.png",
                 eclipse_layout,
                 ECLIPSE_INNER_SIZE,
-                PortraitConfig::new(0, 3, 4.0, 4.0),
+                PortraitConfig::new(eclipse_idle.0, eclipse_idle.1, 4.0, 4.0),
                 Personality::Eclipse,
                 "ECLIPSE",
             );
 
             // ── Stances — the shared body's single standing presence. Only
-            // one is ever visible (see sync_stance_visibility): Solace's stays
-            // under her portrait on the left, Eclipse's under his on the
-            // right, directly beneath the corresponding bubble.
+            // one is ever visible (see sync_stance_visibility). Flanking the
+            // ring itself (not the far viewport wall), close to the galaxy —
+            // a godlike figure standing watch, not another corner readout
+            // like the portrait bubbles above.
+            //
+            // Ring math in UI px: world (0,0) is screen center and world y is
+            // up, so world_x -> WINDOW_WIDTH/2 + world_x and world_y ->
+            // WINDOW_HEIGHT/2 - world_y. Planet sprites are 96*DISPLAY_SCALE
+            // wide (48 half-width), so the ring's real visual edge sits
+            // `RING_RADIUS_X + 48*DISPLAY_SCALE` out from center — the stance
+            // sits a further ~48px gap beyond that.
+            let stance_ring_half_width = RING_RADIUS_X + 48.0 * DISPLAY_SCALE;
+            let stance_gap = 48.0 * DISPLAY_SCALE;
+            let stance_ring_center_ui = Vec2::new(WINDOW_WIDTH / 2.0 + RING_CENTER.x, WINDOW_HEIGHT / 2.0 - RING_CENTER.y);
+            let stance_top_y = stance_ring_center_ui.y - STANCE_SIZE / 2.0;
             for (top_left, image, personality) in [
-                (Vec2::new(180.0, 150.0) * DISPLAY_SCALE + Vec2::new(0.0, PORTRAIT_BUBBLE_SIZE + 30.0), "solace_stance.png", Personality::Solace),
-                (Vec2::new(1292.0, 150.0) * DISPLAY_SCALE + Vec2::new(0.0, PORTRAIT_BUBBLE_SIZE + 30.0), "eclipse_stance.png", Personality::Eclipse),
+                (Vec2::new(stance_ring_center_ui.x - stance_ring_half_width - stance_gap - STANCE_SIZE, stance_top_y), "solace_stance.png", Personality::Solace),
+                (Vec2::new(stance_ring_center_ui.x + stance_ring_half_width + stance_gap, stance_top_y), "eclipse_stance.png", Personality::Eclipse),
             ] {
+                let stance_range = tags.stance(&personality, "stance");
                 root.spawn((
                     ImageNode {
                         image: asset_server.load(image),
-                        texture_atlas: Some(TextureAtlas { layout: stance_layout.clone(), index: 0 }),
+                        texture_atlas: Some(TextureAtlas { layout: stance_layout.clone(), index: stance_range.0 }),
                         ..default()
                     },
                     Node {
@@ -2190,7 +2717,7 @@ fn spawn_cockpit_ui(
                         ..default()
                     },
                     StanceTag(personality),
-                    StanceAnim::default(),
+                    StanceAnim::new(stance_range),
                 ));
             }
 
@@ -2240,6 +2767,30 @@ fn spawn_cockpit_ui(
                     PlanetHologramText,
                 ));
             });
+
+            // ── Map hologram — compass button + topology overview panel ──────
+            spawn_map_hologram(root, asset_server);
+
+            // ── Suspicion meters — top-aligned with the portrait bubbles
+            // (same top y), 30px gap from the bubble frame, on the inner
+            // side toward the galaxy (not the cockpit wall). Top position is
+            // fixed; the bar's own bottom edge is what moves when its size
+            // changes.
+            let suspicion_meter_top = 150.0 * DISPLAY_SCALE;
+            spawn_suspicion_meter(
+                root,
+                asset_server,
+                Vec2::new(180.0 * DISPLAY_SCALE + PORTRAIT_BUBBLE_SIZE + 30.0 * DISPLAY_SCALE, suspicion_meter_top),
+                SOLACE_GOLD,
+                Personality::Solace,
+            );
+            spawn_suspicion_meter(
+                root,
+                asset_server,
+                Vec2::new(1292.0 * DISPLAY_SCALE - SUSPICION_METER_W - 30.0 * DISPLAY_SCALE, suspicion_meter_top),
+                ECLIPSE_PURPLE,
+                Personality::Eclipse,
+            );
         });
 }
 
@@ -2332,11 +2883,147 @@ fn spawn_portrait_bubble(
     });
 }
 
+/// Spawns one personality's suspicion meter: a static frame image plus a
+/// bottom-anchored colored fill bar whose height `sync_suspicion_meter`
+/// keeps in sync with the real, live `SuspicionState` value.
+fn spawn_suspicion_meter(root: &mut ChildSpawnerCommands, asset_server: &AssetServer, top_left: Vec2, tint: Color, personality: Personality) {
+    root.spawn(Node {
+        position_type: PositionType::Absolute,
+        left: Val::Px(top_left.x),
+        top: Val::Px(top_left.y),
+        width: Val::Px(SUSPICION_METER_W),
+        height: Val::Px(SUSPICION_METER_H),
+        ..default()
+    })
+    .with_children(|meter| {
+        meter.spawn((
+            ImageNode { image: asset_server.load("ui_meter_suspicion.png"), ..default() },
+            Node {
+                position_type: PositionType::Absolute,
+                width: Val::Px(SUSPICION_METER_W),
+                height: Val::Px(SUSPICION_METER_H),
+                ..default()
+            },
+        ));
+        meter.spawn((
+            BackgroundColor(tint),
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(SUSPICION_FILL_INSET),
+                right: Val::Px(SUSPICION_FILL_INSET),
+                bottom: Val::Px(SUSPICION_FILL_INSET),
+                height: Val::Px(0.0),
+                ..default()
+            },
+            SuspicionMeterFill(personality),
+        ));
+    });
+}
+
+/// Spawns the compass toggle button (fixed top-right corner) and the map
+/// hologram panel it opens: a miniature of the real galaxy topology, built
+/// from the same `CONNECTIONS`/ring layout the main view uses. Node and edge
+/// visibility are driven by real `GalaxyState` (alive planets), not faked.
+fn spawn_map_hologram(root: &mut ChildSpawnerCommands, asset_server: &AssetServer) {
+    root.spawn((
+        Button,
+        ImageNode { image: asset_server.load("ui_icon_compass.png"), ..default() },
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(WINDOW_WIDTH - 56.0 * DISPLAY_SCALE),
+            top: Val::Px(16.0 * DISPLAY_SCALE),
+            width: Val::Px(40.0 * DISPLAY_SCALE),
+            height: Val::Px(40.0 * DISPLAY_SCALE),
+            ..default()
+        },
+        CompassButtonTag,
+    ));
+
+    root.spawn((
+        ImageNode { image: asset_server.load("ui_panel_map.png"), ..default() },
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px((WINDOW_WIDTH - MAP_PANEL_W) / 2.0),
+            top: Val::Px((WINDOW_HEIGHT - MAP_PANEL_H) / 2.0),
+            width: Val::Px(MAP_PANEL_W),
+            height: Val::Px(MAP_PANEL_H),
+            ..default()
+        },
+        Visibility::Hidden,
+        MapHologramPanel,
+    ))
+    .with_children(|panel| {
+        panel.spawn((
+            ImageNode { image: asset_server.load("ui_clock_phase.png"), ..default() },
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(16.0 * DISPLAY_SCALE),
+                top: Val::Px(28.0 * DISPLAY_SCALE),
+                width: Val::Px(24.0 * DISPLAY_SCALE),
+                height: Val::Px(24.0 * DISPLAY_SCALE),
+                ..default()
+            },
+        ));
+        panel.spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(48.0 * DISPLAY_SCALE),
+                top: Val::Px(30.0 * DISPLAY_SCALE),
+                ..default()
+            },
+            Text::new(""),
+            TextFont { font: FontSource::Handle(asset_server.load(FONT_REGULAR)), font_size: FontSize::Px(14.0), ..default() },
+            TextColor(Color::srgba(0.75, 0.9, 1.0, 0.9)),
+            MapClockText,
+        ));
+
+        // Connection lines first so the node icons draw on top of them.
+        for (i, &(a, b)) in CONNECTIONS.iter().enumerate() {
+            let pa = map_node_local_pos(a);
+            let pb = map_node_local_pos(b);
+            let mid = (pa + pb) / 2.0;
+            let delta = pb - pa;
+            let length = delta.length();
+            let angle = delta.y.atan2(delta.x);
+            panel.spawn((
+                ImageNode { image: asset_server.load("map_line_dash.png"), ..default() },
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(mid.x - length / 2.0),
+                    top: Val::Px(mid.y - MAP_EDGE_THICKNESS / 2.0),
+                    width: Val::Px(length),
+                    height: Val::Px(MAP_EDGE_THICKNESS),
+                    ..default()
+                },
+                UiTransform::from_rotation(Rot2::radians(angle)),
+                MapEdgeTag(i),
+            ));
+        }
+
+        for planet_idx in 0..7usize {
+            let pos = map_node_local_pos(planet_idx);
+            panel.spawn((
+                ImageNode { image: asset_server.load("map_node_known.png"), ..default() },
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(pos.x - MAP_NODE_SIZE / 2.0),
+                    top: Val::Px(pos.y - MAP_NODE_SIZE / 2.0),
+                    width: Val::Px(MAP_NODE_SIZE),
+                    height: Val::Px(MAP_NODE_SIZE),
+                    ..default()
+                },
+                MapNodeTag((planet_idx + 1) as u32),
+            ));
+        }
+    });
+}
+
 // ── Scene setup ───────────────────────────────────────────────────────────────
 
 fn setup(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
+    tags: Res<AnimTags>,
     mut layouts: ResMut<Assets<TextureAtlasLayout>>,
     mut images: ResMut<Assets<Image>>,
     mut primary_cursor: Query<&mut CursorOptions, With<PrimaryWindow>>,
@@ -2520,6 +3207,7 @@ fn setup(
         "planet_houston.png",
         "planet_enterprise.png",
     ];
+    let planet_idle = tags.planet("idle");
     for (i, file) in planet_files.iter().enumerate() {
         let planet_id = (i + 1) as u32;
         let pos = planet_position(i);
@@ -2528,13 +3216,13 @@ fn setup(
                 image: asset_server.load(*file),
                 texture_atlas: Some(TextureAtlas {
                     layout: planet_layout.clone(),
-                    index: 0,
+                    index: planet_idle.0,
                 }),
                 custom_size: Some(Vec2::new(96.0, 96.0) * DISPLAY_SCALE),
                 ..default()
             },
             Transform::from_xyz(pos.x, pos.y, 0.0),
-            AnimationConfig::new(0, 7, 10.0, true),
+            AnimationConfig::new(planet_idle.0, planet_idle.1, 10.0, true),
             PlanetTag(planet_id),
             PlanetState::Alive,
         ));
@@ -2564,8 +3252,9 @@ fn setup(
         },
         Transform::from_xyz(jeb_start.x, jeb_start.y, 2.0),
         ExplorerTag(2),
-        ExplorerAnim::new_jeb(1),
+        ExplorerAnim::new_jeb(1, &tags),
     ));
+    spawn_resource_badges(&mut commands, 2);
 
     // VIVIANA — id 1, 24 frames, 48x48, starts on planet 4
     let viv_layout = layouts.add(TextureAtlasLayout::from_grid(
@@ -2588,10 +3277,13 @@ fn setup(
         },
         Transform::from_xyz(viv_start.x, viv_start.y, 2.0),
         ExplorerTag(1),
-        ExplorerAnim::new_viviana(4),
+        ExplorerAnim::new_viviana(4, &tags),
     ));
+    spawn_resource_badges(&mut commands, 1);
 
-    spawn_cockpit_ui(&mut commands, &asset_server, &mut layouts);
+    commands.insert_resource(ResourceIcons::load(&asset_server));
+
+    spawn_cockpit_ui(&mut commands, &asset_server, &mut layouts, &tags);
 
     if let Some(tx) = ready.0.take() {
         let _ = tx.send(());

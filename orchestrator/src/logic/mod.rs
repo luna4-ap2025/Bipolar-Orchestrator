@@ -199,6 +199,7 @@ fn run_logic_loop(
                 &topology,
                 &planets,
                 &explorers,
+                &prob_registry,
             );
         }
 

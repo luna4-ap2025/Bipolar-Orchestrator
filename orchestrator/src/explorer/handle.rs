@@ -43,6 +43,16 @@ pub struct ExplorerHandle {
     /// Updated by the router after every successful move.
     current_planet: ID,
 
+    /// Most recent `BagContentResponse` the logic loop's regular drain has
+    /// seen for this explorer. Populated asynchronously (see
+    /// `logic::event_handler::handle_one`) rather than fetched with a
+    /// blocking round-trip: a blocking wait on the shared explorer channel
+    /// would risk swallowing a real autonomous message (`NeighborsRequest`,
+    /// `TravelToPlanetRequest`) meant for the logic loop, which is exactly
+    /// what happened when the GUI's per-poll snapshot used to call
+    /// `OrchestratorApi::bag_content` directly.
+    last_bag: BagContent,
+
     /// Join handle for the explorer thread.
     thread_handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -61,6 +71,7 @@ impl ExplorerHandle {
             sender,
             planet_reply_tx,
             current_planet: starting_planet,
+            last_bag: Vec::new(),
             thread_handle: Some(thread_handle),
         }
     }
@@ -78,6 +89,19 @@ impl ExplorerHandle {
     /// Updates the current planet ID after a successful move.
     pub fn set_current_planet(&mut self, planet_id: ID) {
         self.current_planet = planet_id;
+    }
+
+    /// Returns the last `BagContentResponse` the logic loop's drain has
+    /// recorded for this explorer (empty until the first one arrives).
+    pub fn bag(&self) -> &BagContent {
+        &self.last_bag
+    }
+
+    /// Records a fresh `BagContentResponse`, called only from the logic
+    /// loop's own drain of `explorer_rx` — never from a second concurrent
+    /// reader of that channel.
+    pub fn set_bag(&mut self, bag: BagContent) {
+        self.last_bag = bag;
     }
 
     /// Returns the sender that planets use to reply to this explorer.

@@ -12,6 +12,7 @@
 use crate::explorer::ExplorerRegistry;
 use crate::galaxy::Topology;
 use crate::planet::PlanetRegistry;
+use crate::probability::{OrchestratorEvent, ProbabilityRegistry};
 use crate::routing;
 
 use common_game::protocols::orchestrator_explorer::{
@@ -36,6 +37,7 @@ pub fn drain_explorer_messages(
     topology: &Arc<Mutex<Topology>>,
     planets: &Arc<Mutex<PlanetRegistry>>,
     explorers: &Arc<Mutex<ExplorerRegistry>>,
+    prob_registry: &Arc<Mutex<ProbabilityRegistry>>,
 ) {
     loop {
         match explorer_rx.try_recv() {
@@ -46,6 +48,7 @@ pub fn drain_explorer_messages(
                     topology,
                     planets,
                     explorers,
+                    prob_registry,
                 );
             }
 
@@ -66,6 +69,7 @@ fn handle_one(
     topology: &Arc<Mutex<Topology>>,
     planets: &Arc<Mutex<PlanetRegistry>>,
     explorers: &Arc<Mutex<ExplorerRegistry>>,
+    prob_registry: &Arc<Mutex<ProbabilityRegistry>>,
 ) {
     match msg {
         ExplorerToOrchestrator::NeighborsRequest {
@@ -251,7 +255,23 @@ fn handle_one(
 
             if let Ok(mut registry) = explorers.lock() {
                 if let Some(handle) = registry.get_mut(explorer_id) {
+                    // Captured before the overwrite — this is the single point
+                    // (shared by both the autonomous AI path and the manual
+                    // API-triggered move) where a move actually gets confirmed,
+                    // so it's the correct place to record the real hop for the
+                    // GUI, instead of relying on it to notice a polled position
+                    // diff (which can silently miss hops faster than the ~4Hz
+                    // snapshot poll).
+                    let from = handle.current_planet();
                     handle.set_current_planet(planet_id);
+
+                    if let Ok(mut prob) = prob_registry.lock() {
+                        prob.record_event(OrchestratorEvent::ExplorerMoved {
+                            explorer_id,
+                            from,
+                            to: planet_id,
+                        });
+                    }
 
                     log::info!(
                         "Explorer {explorer_id} registry position updated to planet {planet_id}"
@@ -340,6 +360,12 @@ fn handle_one(
             log::debug!(
                 "Explorer {explorer_id} bag content: {bag_content:?}"
             );
+
+            if let Ok(mut registry) = explorers.lock() {
+                if let Some(handle) = registry.get_mut(explorer_id) {
+                    handle.set_bag(bag_content);
+                }
+            }
         }
     }
 }
