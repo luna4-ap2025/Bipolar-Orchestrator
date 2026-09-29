@@ -1,26 +1,8 @@
-// Bevy systems take `Res<T>`/`ResMut<T>`/`Commands`/`Query<T>` by value as a
-// hard requirement of the engine's system-parameter machinery (they are
-// lightweight handles injected by the scheduler, not owned data being moved
-// needlessly) — clippy::pedantic's `needless_pass_by_value` and
-// `too_many_arguments` both misfire on this idiomatic pattern across every
-// Bevy system in this file, so they're disabled crate-wide here rather than
-// suppressed dozens of times per system.
-//
-// `too_many_lines` and `type_complexity` are also disabled crate-wide: this
-// file (~3.6k lines) is a known, tracked piece of technical debt — splitting
-// it into modules is planned but deliberately deferred, since doing so this
-// close to the deadline risks silently breaking Bevy's system-ordering and
-// scheduling, which is easy to get subtly wrong when moving code between
-// files. Multi-field `Query<(...)>` tuples are Bevy's own idiomatic API for
-// requesting several components at once; factoring them into named `type`
-// aliases is a readability nicety, not a correctness concern.
-//
-// Numeric casts (`cast_precision_loss`, `cast_possible_truncation`,
-// `cast_sign_loss`, `cast_lossless`) are all between screen-space pixel
-// coordinates, texture-atlas frame indices, and animation timer counts —
-// values that never exceed a few thousand, far below where `f32`'s 23-bit
-// mantissa or `u32`/`usize` truncation could ever matter. There is no game
-// state or save data flowing through these casts, only rendering math.
+// Pedantic clippy lints that don't fit Bevy code:
+// - systems have to take Res/Query/Commands by value and often need many of them
+// - this file is too long and should be split into modules, but moving systems
+//   around this close to the deadline risks messing up the system ordering
+// - the numeric casts are all pixel coords and frame indices (small values)
 #![allow(
     clippy::needless_pass_by_value,
     clippy::too_many_arguments,
@@ -44,13 +26,11 @@ use std::f32::consts::{FRAC_PI_2, PI};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-// ── User-triggered orchestrator commands ───────────────────────────────────────
+// --- Commands from the UI to the orchestrator ---
 //
-// Bevy systems never call `OrchestratorApi` directly (its methods block on
-// channel acks with multi-second timeouts, which would freeze rendering).
-// Instead input systems push a `UiCommand` here; the bridge thread drains it
-// once per tick right alongside the autonomous logic loop, exactly like the
-// CLI's `interactive_loop` shares the same channels with a running logic loop.
+// OrchestratorApi methods block while waiting for acks (with timeouts of a
+// few seconds), so calling them from a Bevy system would freeze the window.
+// Input systems send a UiCommand instead and the bridge thread runs it.
 enum UiCommand {
     Sunray(u32),
     Asteroid(u32),
@@ -59,34 +39,25 @@ enum UiCommand {
         dst: u32,
     },
     ToggleLogic,
-    /// Fetches an explorer's bag content on demand (right-click) — not part of
-    /// the regular snapshot since it requires a channel round-trip.
+    // bag/planet info needs a round trip, so it's only fetched on right-click
     InspectExplorer(u32),
-    /// Fetches a planet's energy cell / rocket state on demand (right-click).
     InspectPlanet(u32),
-    /// Debug-only: forces hostility toward Eclipse (E key) or Solace (S key)
-    /// instantly, to verify the flip without waiting through real playtime.
+    // debug keys E/S, so I can test the Solace/Eclipse flip without waiting
     DebugNudgeHostility(f64),
 }
 
 #[derive(Resource, Clone)]
 struct UiCommands(CmdSender<UiCommand>);
 
-/// The explorer currently selected for a manual move (click explorer, then a
-/// neighboring planet to confirm).
 #[derive(Resource, Default)]
 struct Selection {
     explorer: Option<u32>,
-    /// The planet selected via clicking, fired on by the Sunray/Asteroid
-    /// cockpit buttons rather than immediately on click.
+    // Sunray/Asteroid buttons fire at this planet
     planet: Option<u32>,
 }
 
-/// Client-side mirror of the logic loop's state, for the button label.
-/// Updated optimistically when the user presses Space or clicks the button.
-/// `NotStarted` and `Paused` both mean "toggling sends the same command that
-/// calls `start_logic()`" on the bridge thread — the distinction only matters
-/// for what the button should say.
+// Only used for the Start/Pause/Resume button. NotStarted and Paused send the
+// same command, they just show a different button.
 #[derive(Resource, Clone, Copy, PartialEq)]
 enum LogicRunState {
     NotStarted,
@@ -95,7 +66,6 @@ enum LogicRunState {
 }
 
 impl LogicRunState {
-    /// The state after toggling (pressing Start/Pause/Resume).
     fn toggled(self) -> Self {
         match self {
             LogicRunState::NotStarted | LogicRunState::Paused => LogicRunState::Running,
@@ -104,57 +74,38 @@ impl LogicRunState {
     }
 }
 
-/// One-shot signal so the bridge thread waits for the galaxy scene to exist
-/// before spawning planets and starting the autonomous logic loop. Without
-/// this, `build_api`/`start_logic` ran the instant the process launched, on a
-/// plain OS thread racing Bevy's own multi-second window/GPU-adapter init —
-/// planets could take (and lose) hits before the player ever saw the window.
+// The bridge thread waits for this before building the galaxy. Otherwise it
+// starts while Bevy is still opening the window (takes a few seconds) and
+// planets can get hit before anything is on screen.
 #[derive(Resource)]
 struct ReadySignal(Option<CmdSender<()>>);
 
-// ── Cockpit UI: layout constants, colors, marker components ───────────────────
+// --- Cockpit UI ---
 //
-// The whole cockpit shell (window frame, top/bottom screens, buttons,
-// holograms) comes from one artwork file, `cockpit.png` (a 4-wide packed
-// sheet, 1600x900 per slot — see `cockpit.json`, exported with Aseprite's
-// "Split Layers"). Every rectangle below was measured directly from that
-// file's alpha channel / per-layer bounding boxes, not estimated — see
-// `COCKPIT_*` below. If the art changes, these need re-measuring.
+// All the cockpit art is in cockpit.png, exported from Aseprite with "Split
+// Layers" into a sheet 4 slots wide, 1600x900 per slot. The rectangles below
+// are measured from the layers in that file, so if I change the art they
+// have to be measured again.
 
 const SOLACE_GOLD: Color = Color::srgb(1.0, 0.85, 0.35);
 const ECLIPSE_PURPLE: Color = Color::srgb(0.65, 0.45, 0.95);
 
-/// Pixeloid font family — regular weight, used for all cockpit UI text.
-/// `PixeloidSans-Bold.ttf` and `PixeloidMono.ttf` are also delivered in
-/// `assets/fonts/Pixeloid_Font_1_0/` for future emphasis/mono use, not yet wired.
 const FONT_REGULAR: &str = "fonts/Pixeloid_Font_1_0/PixeloidSans.ttf";
 
-/// All measurements below (`cockpit.png` layer positions, ring layout,
-/// viewport bounds, etc.) were taken at a 1600x900 reference design. The
-/// actual window is displayed at `DISPLAY_SCALE` of that. Vale's presentation
-/// laptop is confirmed 1920x1080 — exactly 16:9, the same aspect ratio as the
-/// 1600x900 reference — so `1920/1600 = 1080/900 = 1.2` fills the screen
-/// edge-to-edge in true fullscreen with zero letterboxing. This is a fixed,
-/// known scale for that specific screen, not a dynamically-computed one; if
-/// this ever needs to run well on a different-resolution monitor, this
-/// (and/or the window mode below) needs revisiting.
-///
-/// Important: `DISPLAY_SCALE` only applies to *destination* (on-screen)
-/// positions/sizes. `cockpit.png` itself is NOT re-cropped — `cockpit_slot_rect`
-/// / `cockpit_full_slot` stay in the original 1600x900-per-slot source-image
-/// space, since that's real pixel data in the actual file, not a design unit.
+// Everything is laid out for 1600x900 and scaled up by 1.2 to fill my
+// laptop's 1920x1080 screen (same 16:9 ratio). On a different resolution this
+// will need changing.
+// The scale is only for on-screen positions/sizes. Crops into cockpit.png stay
+// in the file's own 1600x900 pixel coordinates.
 const DISPLAY_SCALE: f32 = 1.2;
 const WINDOW_WIDTH: f32 = 1600.0 * DISPLAY_SCALE;
 const WINDOW_HEIGHT: f32 = 900.0 * DISPLAY_SCALE;
 
-/// Bounding box of the transparent viewport hole in `cockpit.png`, measured
-/// from its alpha channel (not a perfect rectangle — the window is angled at
-/// the top corners — but this bounding box is used as a permissive click-gate
-/// so galaxy clicks don't also land on cockpit chrome). Scaled to display space.
+// Bounding box of the see-through window in cockpit.png. The real shape has
+// angled top corners, but the box is good enough to ignore clicks on the frame.
 const VIEWPORT_HOLE_MIN: Vec2 = Vec2::new(110.0 * DISPLAY_SCALE, 97.0 * DISPLAY_SCALE);
 const VIEWPORT_HOLE_MAX: Vec2 = Vec2::new(1494.0 * DISPLAY_SCALE, 646.0 * DISPLAY_SCALE);
 
-/// One slot in the 4-wide, 1600x900-per-slot packed cockpit sheet.
 fn cockpit_slot_rect(col: u32, row: u32, local: Rect) -> Rect {
     let origin = Vec2::new(col as f32 * 1600.0, row as f32 * 900.0);
     Rect::new(
@@ -169,10 +120,8 @@ fn cockpit_full_slot(col: u32, row: u32) -> Rect {
     cockpit_slot_rect(col, row, Rect::new(0.0, 0.0, 1600.0, 900.0))
 }
 
-/// A full-canvas cockpit shell layer (window / top screen / bottom screen /
-/// chronicle screen backdrop) stacked at (0,0), 1600x900 — each slot is
-/// transparent except that one layer's own art, so stacking several
-/// recreates the full composited look.
+// Each slot is one full-size layer (transparent except its own art), so
+// stacking them at (0,0) rebuilds the whole cockpit.
 fn cockpit_shell_layer(asset_server: &AssetServer, col: u32, row: u32) -> impl Bundle {
     (
         ImageNode {
@@ -191,10 +140,8 @@ fn cockpit_shell_layer(asset_server: &AssetServer, col: u32, row: u32) -> impl B
     )
 }
 
-/// One clickable cockpit button, cropped tightly to its own art (not the
-/// full slot) and positioned at its exact on-screen pixel rectangle — layer
-/// content coordinates equal on-screen coordinates since every layer is
-/// canvas-aligned.
+// Buttons are cropped to just their own art. Since every layer is canvas
+// sized, the crop rect is also where the button goes on screen.
 struct CockpitButtonSpec {
     col: u32,
     row: u32,
@@ -267,8 +214,6 @@ const HOLOGRAM_RIGHT: CockpitButtonSpec = CockpitButtonSpec {
 };
 
 fn cockpit_button_bundle(asset_server: &AssetServer, spec: &CockpitButtonSpec) -> impl Bundle {
-    // Source crop stays in the original 1600x900-per-slot image space;
-    // only the on-screen (destination) position/size is scaled down.
     let w = (spec.local.max.x - spec.local.min.x) * DISPLAY_SCALE;
     let h = (spec.local.max.y - spec.local.min.y) * DISPLAY_SCALE;
     (
@@ -288,20 +233,14 @@ fn cockpit_button_bundle(asset_server: &AssetServer, spec: &CockpitButtonSpec) -
     )
 }
 
-/// Portrait bubble frame size and the (smaller, centered) portrait sizes inside
-/// it. Solace's art sits slightly bigger in its frame than Eclipse's at equal
-/// Node size, hence the smaller inner size here to visually match.
+// Solace's drawing fills more of its frame than Eclipse's, so it gets a
+// smaller size to look the same.
 const PORTRAIT_BUBBLE_SIZE: f32 = 128.0 * DISPLAY_SCALE;
 const SOLACE_INNER_SIZE: f32 = 84.0 * DISPLAY_SCALE;
 const ECLIPSE_INNER_SIZE: f32 = 96.0 * DISPLAY_SCALE;
 
-/// The stance sprite is a standing full-body figure for whichever personality
-/// currently controls the shared body. Unlike the portrait bubbles (a
-/// close-up on her current mood, tucked in the corner), the stance is how
-/// she's actually present in front of the galaxy — a large watching figure
-/// flanking the viewport, not a UI readout. Sized well above the portrait
-/// bubble but capped short of "overpowering": about a third of the
-/// viewport's height.
+// Full-body figure of whoever is in control, standing next to the galaxy.
+// Around a third of the viewport height, any bigger felt like too much.
 const STANCE_SIZE: f32 = 240.0 * DISPLAY_SCALE;
 
 #[derive(Component)]
@@ -310,22 +249,15 @@ struct TopBarPersonalityText;
 #[derive(Component)]
 struct TopBarCycleText;
 
-/// Shows which way the real global hostility (see `ProbabilityRegistry`) has
-/// moved over the last sample window. Sunray/asteroid odds are per-planet
-/// curves, not one shared number, but hostility is the one real value that
-/// pushes every curve toward Eclipse (asteroids) or Solace (sunrays) alike,
-/// so its trend is an honest stand-in for "which way the odds are moving"
-/// without inventing a fake precise percentage.
+// Arrow showing whether hostility is going up or down. Each planet has its own
+// probability curve so there's no single "odds" number to show, but hostility
+// pushes all of them the same way.
 #[derive(Component)]
 struct TopBarTrendText;
 
-/// Marks the full-screen "all explorers have died" overlay, hidden until
-/// `sync_game_over_overlay` detects the real backend condition.
 #[derive(Component)]
 struct GameOverOverlay;
 
-/// Tags each of the Start/Pause/Resume cockpit buttons so
-/// `sync_transport_buttons` can show only the one matching `LogicRunState`.
 #[derive(Component, Debug)]
 enum TransportButton {
     Start,
@@ -339,19 +271,15 @@ struct SunrayButtonTag;
 #[derive(Component)]
 struct AsteroidButtonTag;
 
-/// Placeholder text inside the chronicle screen area, until the real Cosmic
-/// Chronicle log is built. Shows the same overview stats the old "Galaxy
-/// Overview" panel had, so that data isn't lost in this pass.
+// TODO: this should become the Cosmic Chronicle event log. For now it just
+// shows some overview stats.
 #[derive(Component)]
 struct ChronicleScreenText;
 
-// ── Entity inspection (holograms) ───────────────────────────────────────────
+// --- Holograms (right-click inspection) ---
 //
-// Right-click a planet or explorer to open its hologram. `Inspecting` is the
-// client-side toggle (which hologram should be visible, and for which id);
-// `Inspection` is the async result of the on-demand data fetch the bridge
-// thread performs (bag content / planet state both require a channel
-// round-trip, so they're fetched once on click rather than every snapshot).
+// Inspecting = which hologram is open. Inspection = the data the bridge
+// thread fetched for it (filled in a bit later, since it's a round trip).
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InspectTarget {
@@ -381,11 +309,10 @@ enum InspectionData {
 #[derive(Resource, Clone)]
 struct Inspection(Arc<Mutex<InspectionData>>);
 
-/// Marks the left hologram panel (shows explorer bag contents).
+// left panel = explorer bag, right panel = planet
 #[derive(Component)]
 struct ExplorerHologram;
 
-/// Marks the right hologram panel (shows planet state).
 #[derive(Component)]
 struct PlanetHologram;
 
@@ -400,16 +327,11 @@ fn format_mmss(seconds: f64) -> String {
     format!("{:02}:{:02}", total / 60, total % 60)
 }
 
-// ── Map hologram ────────────────────────────────────────────────────────────
+// --- Map hologram ---
 //
-// A toggleable overview panel (compass button opens/closes it) showing the
-// real galaxy topology in miniature: one node per alive planet, dashed
-// connection art between real neighbor pairs (same adjacency `draw_connections`
-// already draws in the main view), plus the current phase/personality —
-// all read from the same `GalaxyState` the rest of the GUI uses, nothing new
-// simulated just for this panel.
+// Compass button toggles a small map of the galaxy: alive planets, the
+// connections between them, and the current phase.
 
-/// Toggled by the compass button; drives the panel's visibility.
 #[derive(Resource, Default)]
 struct MapHologramOpen(bool);
 
@@ -422,8 +344,7 @@ struct MapHologramPanel;
 #[derive(Component)]
 struct MapNodeTag(u32);
 
-/// Index into `CONNECTIONS` — both ends' planet ids are derived from it when
-/// deciding whether this edge is still visible.
+// index into CONNECTIONS
 #[derive(Component)]
 struct MapEdgeTag(usize);
 
@@ -434,16 +355,13 @@ const MAP_PANEL_W: f32 = 480.0 * DISPLAY_SCALE;
 const MAP_PANEL_H: f32 = 384.0 * DISPLAY_SCALE;
 const MAP_RING_RADIUS_X: f32 = 150.0 * DISPLAY_SCALE;
 const MAP_RING_RADIUS_Y: f32 = 100.0 * DISPLAY_SCALE;
-/// Local (top-left-origin, y-down) center of the mini ring within the panel —
-/// offset down from the panel's geometric center to leave room for the
-/// clock/phase readout at the top.
+// pushed down a bit to leave room for the clock text at the top
 const MAP_RING_CENTER: Vec2 =
     Vec2::new(MAP_PANEL_W / 2.0, MAP_PANEL_H / 2.0 + 30.0 * DISPLAY_SCALE);
 const MAP_NODE_SIZE: f32 = 28.0 * DISPLAY_SCALE;
 const MAP_EDGE_THICKNESS: f32 = 6.0 * DISPLAY_SCALE;
 
-/// Same elliptical-ring layout as `planet_position`, but in UI-local
-/// (y-down) space sized to fit inside the map panel.
+// same ring as planet_position, but in UI coords (y goes down)
 fn map_node_local_pos(index: usize) -> Vec2 {
     let angle = FRAC_PI_2 - index as f32 * 2.0 * PI / 7.0;
     MAP_RING_CENTER
@@ -453,14 +371,12 @@ fn map_node_local_pos(index: usize) -> Vec2 {
         )
 }
 
-// ── Embedded galaxy config ────────────────────────────────────────────────────
+// --- Galaxy config ---
 
 const GALAXY_SRC: &str = include_str!("../../galaxy.txt");
 const PLANETS_SRC: &str = include_str!("../../planets.toml");
 
-/// Planet id -> display name, parsed once from `planets.toml` client-side
-/// (the same file the bridge thread's `build_api` reads) so the GUI never
-/// has to round-trip to the orchestrator just to know who owns a planet.
+// Read planets.toml here too so names don't need a round trip.
 #[derive(Resource)]
 struct PlanetNames(HashMap<u32, &'static str>);
 
@@ -481,9 +397,7 @@ impl PlanetNames {
     }
 }
 
-/// Explorer id -> character name. Fixed at spawn time everywhere the
-/// explorers are created (`builder.rs`, `main.rs`): Viviana is always 1,
-/// Jebediah always 2.
+// ids are fixed in builder.rs / main.rs
 fn explorer_display_name(id: u32) -> &'static str {
     match id {
         1 => "Viviana",
@@ -492,8 +406,7 @@ fn explorer_display_name(id: u32) -> &'static str {
     }
 }
 
-/// Maps a factory crate name (from `planets.toml`) to the team's display
-/// name, per the professor's "PLANETS REPO'S" list.
+// names as written in the professor's planet repo list
 fn display_name(factory: &str) -> &'static str {
     match factory {
         "orbitron" => "Orbitron",
@@ -507,14 +420,10 @@ fn display_name(factory: &str) -> &'static str {
     }
 }
 
-// ── Bevy resources ─────────────────────────────────────────────────────────────
+// --- Resources ---
 
-/// `None` until the bridge thread has written a real snapshot at least once.
-/// Distinguishing "not ready yet" from "a real snapshot with zero alive
-/// planets" matters: without it, the default empty snapshot present during
-/// the first ~250ms would look identical to "the whole galaxy just died",
-/// which used to make every planet incorrectly skip its death animation (see
-/// `sync_planets`).
+// None until the first snapshot arrives. An empty default snapshot would look
+// like every planet is dead and they'd all play their death animation.
 #[derive(Resource, Clone)]
 struct LiveSnapshot(Arc<Mutex<Option<GalaxySnapshot>>>);
 
@@ -522,26 +431,18 @@ struct LiveSnapshot(Arc<Mutex<Option<GalaxySnapshot>>>);
 struct GalaxyState {
     alive: HashSet<u32>,
     explorer_planet: HashMap<u32, u32>,
-    /// Real bag content per explorer, fetched live from the explorer thread
-    /// each snapshot poll (`OrchestratorApi::bag_content`) — not GUI-guessed.
     explorer_bag: HashMap<u32, Vec<(ResourceKind, usize)>>,
-    /// Real, live adjacency from the backend topology — replaces the old
-    /// hardcoded ring, which never reflected planets dying.
+    // current neighbors, shrinks when planets are destroyed
     neighbors: HashMap<u32, Vec<u32>>,
     personality: Personality,
-    /// Global hostility in `[0.0, 1.0]`; drives the Solace/Eclipse crossfade.
+    // 0.0 - 1.0, drives the Solace/Eclipse crossfade
     hostility: f64,
     phase_elapsed: f64,
-    /// False until `poll_snapshot` has read a real snapshot at least once.
-    /// Without this, `alive` starts as an empty `HashSet` by default —
-    /// indistinguishable from "every planet just died" — and systems like
-    /// `sync_planets` would read that empty default during the startup
-    /// window before the bridge thread's first real update arrives, kicking
-    /// off every planet's death animation before the game even begins.
+    // same problem as LiveSnapshot: before the first poll `alive` is empty,
+    // so sync_planets waits for this
     ready: bool,
 }
 
-/// Direction the real hostility value has moved over the last sample window.
 #[derive(Clone, Copy, PartialEq, Default)]
 enum HostilityDirection {
     Rising,
@@ -550,9 +451,8 @@ enum HostilityDirection {
     Steady,
 }
 
-/// Coarsely re-sampled every [`HOSTILITY_TREND_SAMPLE_SECS`] of wall time so a
-/// single tiny tick-to-tick wobble in hostility doesn't flip the arrow back
-/// and forth every frame.
+// Sampled every couple of seconds, otherwise small wobbles make the arrow
+// flicker.
 #[derive(Resource, Default)]
 struct HostilityTrend {
     last_value: f64,
@@ -561,18 +461,14 @@ struct HostilityTrend {
 }
 
 const HOSTILITY_TREND_SAMPLE_SECS: f32 = 2.0;
-/// Below this real change in hostility over one sample window, treat it as
-/// noise rather than a real trend (a bare ramp step over 2s is roughly
-/// `HOSTILITY_PER_SEC * 2.0 ≈ 0.0083`, well above this).
+// the normal ramp moves ~0.008 in 2s, so anything under this is noise
 const HOSTILITY_TREND_EPSILON: f64 = 0.0015;
 
-/// Queues a one-shot glitch overlay flash on a portrait, fired when a manual
-/// sunray/asteroid override "infiltrates" that personality's mood.
+// Portraits that should flash the glitch effect (after a manual override)
 #[derive(Resource, Default)]
 struct GlitchQueue(Vec<Personality>);
 
-/// Marks the glitch-flash overlay child of one portrait bubble. `remaining`
-/// counts down from [`GLITCH_DURATION_SECS`]; `0.0` means hidden.
+// remaining == 0.0 means hidden
 #[derive(Component, Default)]
 struct GlitchOverlay {
     remaining: f32,
@@ -580,17 +476,10 @@ struct GlitchOverlay {
 
 const GLITCH_DURATION_SECS: f32 = 1.2;
 
-/// How suspicious each personality is of the player, as a discrete tier: 0 =
-/// calm, 1 = confused, 2 = suspicious. Driven entirely by real manual
-/// overrides (the same "infiltration" moments that already trigger
-/// `GlitchQueue`) via `apply_manual_override` — not a fabricated stat, and
-/// not a continuously-decaying meter either: each personality has a
-/// preferred action (Solace: Sunray, Eclipse: Asteroid). An override that
-/// matches her own preference only ever nudges her to "confused" — she isn't
-/// against it, just puzzled she didn't choose to act. An override AGAINST
-/// her preference escalates one tier per occurrence; the third one is a
-/// refusal — the request is blocked outright and the tier resets to 0,
-/// exactly like the pressure "resolved itself" for her.
+// Suspicion: 0 = calm, 1 = confused, 2 = suspicious.
+// Solace likes sunrays and Eclipse likes asteroids. If the player forces the
+// one she likes, she only gets confused. If they force the other one, she gets
+// more suspicious each time, and the third time she refuses and goes back to 0.
 #[derive(Resource, Default)]
 struct SuspicionState {
     solace_tier: u8,
@@ -613,21 +502,15 @@ impl SuspicionState {
     }
 }
 
-/// Highest resting tier (2 = suspicious); tier 3 (refusal) is instantaneous —
-/// it blocks the action and immediately resets to 0, so it's never a resting
-/// state the meter needs to render.
+// the refusal isn't a tier of its own, it resets to 0 right away
 const SUSPICION_MAX_RESTING_TIER: u8 = 2;
 
 enum SuspicionOutcome {
-    /// The request goes through. `reaction` is the portrait animation tag to
-    /// queue, if any (only fires the moment a tier is first reached).
+    // reaction = portrait animation to play, only when a new tier is reached
     Allowed { reaction: Option<&'static str> },
-    /// The third against-preference override in a row: blocked outright.
     Refused,
 }
 
-/// Applies one manual Sunray/Asteroid override to `personality`'s suspicion
-/// tier and decides whether the request is allowed through.
 fn apply_manual_override(
     state: &mut SuspicionState,
     personality: &Personality,
@@ -656,19 +539,14 @@ fn apply_manual_override(
     }
 }
 
-/// Marks a suspicion meter's fill bar, bottom-anchored, height driven by the
-/// matching personality's live suspicion tier.
 #[derive(Component)]
 struct SuspicionMeterFill(Personality);
 
-/// Top-anchored at the same level as the portrait bubble (see
-/// `spawn_suspicion_meter` call sites) — the top position is fixed, so the
-/// bar's bottom edge is what moves when its size changes.
 const SUSPICION_METER_W: f32 = 30.0 * DISPLAY_SCALE;
 const SUSPICION_METER_H: f32 = 88.0 * DISPLAY_SCALE;
 const SUSPICION_FILL_INSET: f32 = 3.0 * DISPLAY_SCALE;
 
-// ── ECS components ─────────────────────────────────────────────────────────────
+// --- Components ---
 
 #[derive(Component)]
 struct AnimationConfig {
@@ -676,7 +554,7 @@ struct AnimationConfig {
     last: usize,
     timer: Timer,
     looping: bool,
-    // When the current one-shot ends, optionally play another range before hiding.
+    // range to play after the current one-shot, before hiding
     next_range: Option<(usize, usize)>,
     pending_hide: bool,
 }
@@ -707,7 +585,6 @@ enum PlanetState {
 #[derive(Component)]
 struct ExplorerTag(u32);
 
-/// Loaded once at startup: one icon texture per real carried-resource kind.
 #[derive(Resource)]
 struct ResourceIcons(HashMap<ResourceKind, Handle<Image>>);
 
@@ -736,9 +613,7 @@ impl ResourceIcons {
     }
 }
 
-/// How many carried-resource icons to show at once above an explorer's
-/// sprite. `slot` indexes into that explorer's real bag content; slots past
-/// the end of the bag are simply hidden.
+// resource icons shown above each explorer, extra slots are hidden
 const RESOURCE_BADGE_SLOTS: usize = 3;
 
 #[derive(Component)]
@@ -753,30 +628,25 @@ enum ExplorerPhase {
     Departing,
     Moving,
     Arrived,
-    /// One-shot "`react_other`" — played when this explorer notices it's sharing
-    /// a planet with the other explorer. They can't actually communicate, so
-    /// this is a GUI-only flourish reacting to real, shared position data.
+    // the "oh, it's you" animation when both explorers end up on the same
+    // planet (just visual, explorers can't talk to each other)
     ReactingOther,
 }
 
 const CO_REACT_HOLD_SECS: f32 = 1.0;
 
-/// Per-explorer movement + animation state machine.
-/// Explorers do NOT use `AnimationConfig` — this owns all their animation state.
+// Explorers don't use AnimationConfig, everything for them is in here.
 #[derive(Component)]
 struct ExplorerAnim {
-    // Frame ranges (inclusive), all read from this explorer's own Aseprite
-    // JSON export (jeb.json / viviana.json) rather than hand-copied.
+    // frame ranges come from jeb.json / viviana.json
     moving_range: (usize, usize),
     arrived_range: (usize, usize),
     departing_range: (usize, usize),
-    // The "settled" range is what plays when the explorer is resting on a
-    // planet. Viviana: collecting. Jeb: idle.
+    // resting on a planet: Viviana collects, Jeb idles
     settled_range: (usize, usize),
     react_other_range: (usize, usize),
     fps: f32,
     anim_timer: Timer,
-    // Movement state.
     cur_planet: u32,
     target_planet: u32,
     from_pos: Vec2,
@@ -784,20 +654,11 @@ struct ExplorerAnim {
     move_t: f32,
     phase: ExplorerPhase,
     phase_timer: Timer,
-    /// Whether this explorer was sharing a planet with another explorer as of
-    /// the last check. Edge-triggered: `react_other` fires the instant this
-    /// flips false -> true (checked every frame against real backend
-    /// positions, not sampled periodically), and resets to false as soon as
-    /// this explorer leaves the planet, so two explorers get a fresh "oh, you
-    /// again" every time their paths actually cross rather than once per
-    /// fixed interval.
+    // so react_other plays once each time they meet, not every frame
     was_co_located: bool,
-    /// Real hops (destination planet ids), one per confirmed `ExplorerMoved`
-    /// event, in the order the backend actually reported them. Consumed one
-    /// at a time from `Settled`/`ReactingOther` — this is what guarantees a
-    /// burst of several real moves landing between two ~250ms snapshot polls
-    /// still gets animated through every intermediate planet, in order,
-    /// instead of only ever showing wherever the explorer most recently was.
+    // One entry per ExplorerMoved event. An explorer can move several times
+    // between two snapshots (250ms), so we queue the hops and animate each one
+    // instead of jumping straight to the last planet.
     pending_hops: VecDeque<u32>,
 }
 
@@ -866,7 +727,6 @@ struct PortraitConfig {
     hold_secs: f32,
     holding: bool,
     hold_timer: Timer,
-    // Reactions queued to play after the current one finishes holding.
     pending: VecDeque<(usize, usize)>,
 }
 
@@ -911,19 +771,15 @@ struct PortraitReaction {
     target: Personality,
     first: usize,
     last: usize,
-    // true = interrupt whatever is playing and clear pending; false = queue after current reaction
+    // true = interrupt the current one and clear the queue
     priority: bool,
 }
 
-// ── Animation tags (loaded from the Aseprite JSON exports) ────────────────────
+// --- Animation tags ---
 //
-// solace.json/eclipse.json each ship a `meta.frameTags` array naming every
-// animation ("idle", "sending", "unwanted_event", "breaking", "awakening",
-// etc.) with its frame range. Frame ranges used to be hand-copied into the
-// event-dispatch match arms below as bare numbers — correct today, but silently
-// stale the moment either sheet is ever re-exported with a different frame
-// count, with no compiler error to catch it. Reading the tag names by name
-// from the JSON at startup means the source of truth is the export itself.
+// Frame ranges are read by tag name from the Aseprite JSON exports, so
+// re-exporting a sheet with a different number of frames doesn't break the
+// animations.
 #[derive(serde::Deserialize)]
 struct AsepriteFrameTag {
     name: String,
@@ -950,20 +806,13 @@ struct AnimTags {
     eclipse_stance: HashMap<String, (usize, usize)>,
     jeb: HashMap<String, (usize, usize)>,
     viviana: HashMap<String, (usize, usize)>,
-    /// All 7 `planet_*.json` exports share identical tag names/ranges
-    /// (checked directly: idle/hit/receive/dying/destroyed are byte-for-byte
-    /// the same across every planet type) — one shared map covers all of them,
-    /// no per-planet-type lookup needed.
+    // all 7 planet sheets have the same tags, so one map is enough
     planet: HashMap<String, (usize, usize)>,
     sunray: HashMap<String, (usize, usize)>,
     asteroid: HashMap<String, (usize, usize)>,
 }
 
 impl AnimTags {
-    /// Reads every sheet's `.json` export straight from the assets folder —
-    /// the same folder Bevy's own asset server resolves `asset_server.load`
-    /// paths against (`CARGO_MANIFEST_DIR`/assets in dev builds), so this
-    /// stays in lockstep with whatever sheet is actually being rendered.
     fn load() -> Self {
         Self {
             solace: Self::load_one("solace.json"),
@@ -999,9 +848,8 @@ impl AnimTags {
             .collect()
     }
 
-    /// Frame range for a named tag on `personality`'s portrait sheet. Panics
-    /// on an unrecognized tag — a typo here should fail loudly at startup
-    /// instead of silently playing nothing (or the wrong frames).
+    // Panics on unknown tags on purpose: a typo should crash at startup, not
+    // silently play the wrong frames.
     fn get(&self, personality: &Personality, tag: &str) -> (usize, usize) {
         let map = match personality {
             Personality::Solace => &self.solace,
@@ -1010,7 +858,6 @@ impl AnimTags {
         Self::lookup(map, tag, "solace.json/eclipse.json")
     }
 
-    /// Frame range for a named tag on `personality`'s stance sheet.
     fn stance(&self, personality: &Personality, tag: &str) -> (usize, usize) {
         let map = match personality {
             Personality::Solace => &self.solace_stance,
@@ -1019,27 +866,22 @@ impl AnimTags {
         Self::lookup(map, tag, "solace_stance.json/eclipse_stance.json")
     }
 
-    /// Frame range for a named tag on Jeb's sheet (`jeb.json`).
     fn jeb(&self, tag: &str) -> (usize, usize) {
         Self::lookup(&self.jeb, tag, "jeb.json")
     }
 
-    /// Frame range for a named tag on Viviana's sheet (`viviana.json`).
     fn viviana(&self, tag: &str) -> (usize, usize) {
         Self::lookup(&self.viviana, tag, "viviana.json")
     }
 
-    /// Frame range for a named tag shared by every planet sheet.
     fn planet(&self, tag: &str) -> (usize, usize) {
         Self::lookup(&self.planet, tag, "planet_*.json")
     }
 
-    /// Frame range for a named tag on the sunray projectile sheet.
     fn sunray(&self, tag: &str) -> (usize, usize) {
         Self::lookup(&self.sunray, tag, "sunray.json")
     }
 
-    /// Frame range for a named tag on the asteroid projectile sheet.
     fn asteroid(&self, tag: &str) -> (usize, usize) {
         Self::lookup(&self.asteroid, tag, "asteroid.json")
     }
@@ -1062,10 +904,10 @@ struct PlanetReactionQueue(VecDeque<PlanetReaction>);
 #[derive(Resource, Default)]
 struct PortraitEventQueue(VecDeque<PortraitReaction>);
 
-// ── Ambient background movement ────────────────────────────────────────────────
+// --- Background movement ---
 
-/// Slow sine-wave bob + rotation for world-space sprites (nebulas). Avoids
-/// needing wrap-around logic — it just oscillates gently around a fixed point.
+// Nebulas just bob around a fixed point with a sine wave, so there's no
+// wrap-around to deal with.
 #[derive(Component)]
 struct DriftBob {
     base: Vec2,
@@ -1075,23 +917,16 @@ struct DriftBob {
     rot_speed: f32,
 }
 
-/// Which nebula variant is tied to which personality; only the active one
-/// fades in, the other fades out — same crossfade idea as the vignette tint.
+// only the active personality's nebula is faded in
 #[derive(Component)]
 struct NebulaTag(Personality);
 
-/// Marks one of the two stance sprites (the standing full-body figure for a
-/// personality). Unlike the portrait bubbles — which are both always visible,
-/// just dimmed/brightened by dominance — only ONE stance is ever shown: the
-/// shared body has a single physical presence, so there can never be two
-/// stances visible at once. `sync_stance_visibility` hides whichever tag
-/// doesn't match the currently active personality.
+// Both portraits are always on screen, but only one stance is: Solace and
+// Eclipse share one body, so she can only be standing there once.
 #[derive(Component)]
 struct StanceTag(Personality);
 
-/// Drives the small 4-frame standing-idle loop on a stance sprite. Separate
-/// from `PortraitConfig`/`AnimationConfig` since a stance never reacts to
-/// events or plays one-shots — it just idles forever while visible.
+// Stances only ever idle, so they don't need PortraitConfig.
 #[derive(Component)]
 struct StanceAnim {
     first: usize,
@@ -1109,7 +944,6 @@ impl StanceAnim {
     }
 }
 
-/// Periodic brightness pulse for "flashing" bright stars.
 #[derive(Component)]
 struct Twinkle {
     speed: f32,
@@ -1118,9 +952,7 @@ struct Twinkle {
     pulse_alpha: f32,
 }
 
-/// Same sine-wave bob as `DriftBob`, but for UI-space stars drifting *inside*
-/// a panel (Concept 3, "Nebula Glass") — driven through `Node.left/top`
-/// instead of `Transform`, since these are `bevy_ui` children, not world sprites.
+// DriftBob for stars inside UI panels (moves Node.left/top, not Transform)
 #[derive(Component)]
 struct PanelStarBob {
     base: Vec2,
@@ -1144,15 +976,13 @@ impl Default for ShootingStarTimer {
     }
 }
 
-/// Custom star cursor — the OS cursor is hidden and this follows it instead.
+// star cursor (the OS cursor is hidden)
 #[derive(Component)]
 struct CursorTag;
 
-// ── Galaxy layout ─────────────────────────────────────────────────────────────
+// --- Galaxy layout ---
 
-// Mirrors the real topology in `galaxy.txt` — a circulant C7(1,2) graph
-// (distance-1 ring edges plus distance-2 cross-links), not the old plain
-// 7-edge ring.
+// Same as galaxy.txt: each planet connects to the next one and the one after.
 const CONNECTIONS: &[(usize, usize)] = &[
     (0, 1),
     (1, 2),
@@ -1170,20 +1000,14 @@ const CONNECTIONS: &[(usize, usize)] = &[
     (6, 1),
 ];
 
-/// Elliptical, not circular — the viewport hole has much more horizontal
-/// room than vertical (top screen + bottom console eat into height far more
-/// than the walls eat into width), so a uniform radius either clips the top
-/// planet under the top screen or wastes the available width. Radii chosen
-/// with real margin, not a knife-edge fit: topmost planet's sprite edge
-/// lands ~140px below the top screen's bottom edge (y=68), and the bottom
-/// stays ~50px clear of the console (y=647).
+// An ellipse because the viewport is much wider than it is tall. With a
+// circle the top planet went under the top screen. Leaves ~140px below the
+// top screen and ~50px above the console.
 const RING_RADIUS_X: f32 = 230.0 * DISPLAY_SCALE;
 const RING_RADIUS_Y: f32 = 175.0 * DISPLAY_SCALE;
 
-/// Center of the ring in world space. The cockpit's viewport hole (measured
-/// directly from `cockpit.png`'s alpha channel) is centered slightly above
-/// screen-center because the bottom console (253px) is much taller than the
-/// top screen (64px) — this offsets the ring to match, not screen center.
+// The viewport is a bit above screen center (the bottom console is way
+// taller than the top screen), so the ring moves up with it.
 const RING_CENTER: Vec2 = Vec2::new(0.0, 78.0 * DISPLAY_SCALE);
 
 fn planet_position(index: usize) -> Vec2 {
@@ -1191,10 +1015,8 @@ fn planet_position(index: usize) -> Vec2 {
     RING_CENTER + Vec2::new(RING_RADIUS_X * angle.cos(), RING_RADIUS_Y * angle.sin())
 }
 
-/// UI-space top-left corner of `personality`'s stance sprite (see the stance
-/// spawn loop in `spawn_cockpit_ui`, which uses this same math). Shared here
-/// so the sunray/asteroid projectile system can find the same anchor point
-/// without duplicating the ring-offset constants.
+// Top-left of the stance in UI coords. Also used by the projectiles, since
+// sunrays/asteroids are thrown from the stance.
 fn stance_ui_top_left(personality: &Personality) -> Vec2 {
     let stance_ring_half_width = RING_RADIUS_X + 48.0 * DISPLAY_SCALE;
     let stance_gap = 48.0 * DISPLAY_SCALE;
@@ -1215,11 +1037,8 @@ fn stance_ui_top_left(personality: &Personality) -> Vec2 {
     }
 }
 
-/// World-space center of `personality`'s stance sprite, using the inverse of
-/// the UI-space conversion documented on the stance spawn loop (`world_x` ->
-/// `WINDOW_WIDTH/2` + `world_x`, `world_y` -> `WINDOW_HEIGHT/2` - `world_y`). Used as
-/// the spawn point for sunray/asteroid projectiles, which are world-space
-/// sprites like planets and explorers, not `bevy_ui` nodes like the stance itself.
+// Same point in world coords, because projectiles are sprites and the stance
+// is a UI node.
 fn stance_world_pos(personality: &Personality) -> Vec2 {
     let ui_center = stance_ui_top_left(personality) + Vec2::splat(STANCE_SIZE / 2.0);
     Vec2::new(
@@ -1243,8 +1062,6 @@ fn smoothstep(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-// ── Entry point ───────────────────────────────────────────────────────────────
-
 fn main() {
     let snapshot: Arc<Mutex<Option<GalaxySnapshot>>> = Arc::new(Mutex::new(None));
     let snap_write = Arc::clone(&snapshot);
@@ -1256,22 +1073,17 @@ fn main() {
     let (ready_tx, ready_rx) = crossbeam_channel::bounded::<()>(1);
 
     std::thread::spawn(move || {
-        // Wait for the galaxy scene to actually be on screen (signaled by
-        // `setup`) before spawning planets and starting the logic loop.
+        // wait until setup() has the scene on screen
         let _ = ready_rx.recv();
 
         let mut api = bipolar_orchestrator::builder::build_api(GALAXY_SRC, PLANETS_SRC);
 
-        // Logic does NOT auto-start anymore — the galaxy sits static (planets,
-        // explorers, everything spawned but idle) until the user presses the
-        // Start button. Lets a demo show the assets first, then trigger motion.
+        // Logic waits for the Start button, so in a demo I can show
+        // everything first before things start moving.
         *snap_write.lock().unwrap() = Some(bipolar_orchestrator::snapshot::build(&api));
 
         let mut logic_running = false;
         loop {
-            // Drain manual commands from the GUI before sleeping. These share the
-            // same orchestrator channels as the autonomous logic loop — the same
-            // way the CLI's `interactive_loop` does when logic is running.
             drain_ui_commands(&cmd_rx, &mut api, &mut logic_running, &inspection_write);
 
             std::thread::sleep(Duration::from_millis(250));
@@ -1287,27 +1099,17 @@ fn main() {
                 .set(WindowPlugin {
                     primary_window: Some(Window {
                         title: "Bipolar Orchestrator".to_string(),
-                        // `with_scale_factor_override(1.0)` forces 1 logical
-                        // pixel == 1 physical pixel, ignoring whatever the OS
-                        // DPI/display-scaling setting is. Without it, the
-                        // window itself comes out at the exact WINDOW_WIDTH/
-                        // HEIGHT physical size, but bevy_ui's `Val::Px` layout
-                        // (which all our cockpit positions use) gets scaled
-                        // by the OS's scale factor on top of that — the two
-                        // stop agreeing, leaving dead space or clipping
-                        // depending on which way the mismatch goes.
+                        // Ignore Windows display scaling, otherwise the UI
+                        // (Val::Px) gets scaled again and stops lining up
+                        // with the cockpit art.
                         resolution: WindowResolution::new(
                             WINDOW_WIDTH as u32,
                             WINDOW_HEIGHT as u32,
                         )
                         .with_scale_factor_override(1.0),
-                        // True borderless fullscreen: no title bar, sits above
-                        // the taskbar entirely — needed for the presentation.
-                        // Bevy overrides the requested resolution to match the
-                        // monitor's actual physical size in this mode, which
-                        // is exactly why DISPLAY_SCALE above is tuned to
-                        // Vale's confirmed 1920x1080 screen (1.2x of the
-                        // 1600x900 reference, matching precisely).
+                        // Fullscreen for the presentation. This uses the
+                        // monitor's resolution, which is why DISPLAY_SCALE
+                        // is set for 1920x1080.
                         mode: bevy::window::WindowMode::BorderlessFullscreen(
                             bevy::window::MonitorSelection::Primary,
                         ),
@@ -1403,9 +1205,7 @@ fn main() {
         .run();
 }
 
-/// Non-blocking drain of every pending [`UiCommand`], executed on the bridge
-/// thread. Each variant maps directly to the same `OrchestratorApi` method the
-/// CLI's `interactive_loop` calls.
+// Runs on the bridge thread. Same API calls the CLI makes.
 fn drain_ui_commands(
     cmd_rx: &CmdReceiver<UiCommand>,
     api: &mut bipolar_orchestrator::api::OrchestratorApi,
@@ -1480,7 +1280,7 @@ fn drain_ui_commands(
     }
 }
 
-// ── Bridge / snapshot systems ──────────────────────────────────────────────────
+// --- Reading snapshots ---
 
 fn poll_snapshot(
     mut commands: Commands,
@@ -1496,21 +1296,16 @@ fn poll_snapshot(
         return;
     };
     let Some(snap) = guard.as_mut() else { return };
-    // Drain events immediately. This system runs every rendered frame (up to
-    // 60-144fps) but the bridge thread only produces a new snapshot every
-    // ~250ms — reading `&snap.events` without draining replayed the same
-    // events dozens of times per snapshot, ballooning the portrait reaction
-    // queue into the thousands and burying every new event under a backlog
-    // that would take minutes to play through. That's why nothing new ever
-    // visibly triggered.
+    // Take the events out. This runs every frame but a snapshot only comes
+    // every 250ms, so without take() the same events got handled over and over
+    // and the reaction queue filled up.
     let events = std::mem::take(&mut snap.events);
     state.ready = true;
 
     let new_personality = snap.personality.clone();
 
     if new_personality != state.personality {
-        // The loser's "breaking" plays, the winner's "awakening" plays —
-        // frame ranges read from each sheet's own JSON export, not hand-copied.
+        // loser plays "breaking", winner plays "awakening"
         let (loser, winner) = match &new_personality {
             Personality::Eclipse => (Personality::Solace, Personality::Eclipse),
             Personality::Solace => (Personality::Eclipse, Personality::Solace),
@@ -1531,12 +1326,12 @@ fn poll_snapshot(
         });
     }
 
-    // Use the OLD personality (state.personality) to read intent: events fired under it.
+    // state.personality is still the old one here, which is who these
+    // events actually happened under
     for event in &events {
         match event {
             GalaxyEvent::SunraySent { planet_id } => {
-                // Solace reacts by "sending"; Eclipse's sunray is unwelcome —
-                // her "unwanted_event" tag.
+                // Eclipse doesn't want sunrays
                 let tag = match state.personality {
                     Personality::Solace => "sending",
                     Personality::Eclipse => "unwanted_event",
@@ -1558,7 +1353,6 @@ fn poll_snapshot(
             }
             GalaxyEvent::SunrayReceived { planet_id } => {
                 if state.personality == Personality::Solace {
-                    // Sunray landed — Solace is happy
                     let (first, last) = tags.get(&Personality::Solace, "satisfied");
                     queue.0.push_back(PortraitReaction {
                         target: Personality::Solace,
@@ -1575,11 +1369,8 @@ fn poll_snapshot(
                 });
             }
             GalaxyEvent::AsteroidSent { planet_id } => {
-                // Solace's "unwanted_event" (guilty — she doesn't want to kill)
-                // is high priority: it interrupts whatever's queued/playing
-                // instead of waiting its turn, so it's never buried behind
-                // routine sunray reactions and missed. Eclipse's "sending" is
-                // routine, stays low priority.
+                // Solace feeling guilty is priority so it doesn't get lost
+                // behind all the normal sunray reactions
                 let (tag, priority) = match state.personality {
                     Personality::Eclipse => ("sending", false),
                     Personality::Solace => ("unwanted_event", true),
@@ -1601,7 +1392,6 @@ fn poll_snapshot(
             }
             GalaxyEvent::AsteroidDeflected { planet_id } => {
                 if state.personality == Personality::Eclipse {
-                    // Asteroid hit — Eclipse is satisfied
                     let (first, last) = tags.get(&Personality::Eclipse, "satisfied");
                     queue.0.push_back(PortraitReaction {
                         target: Personality::Eclipse,
@@ -1618,7 +1408,7 @@ fn poll_snapshot(
                 });
             }
             GalaxyEvent::PlanetDestroyed { planet_id } => {
-                // Trigger the final hit visual; the personality flip handles portraits.
+                // portraits react through the personality flip instead
                 let (first, last) = tags.planet("hit");
                 planet_queue.0.push_back(PlanetReaction {
                     planet_id: *planet_id,
@@ -1627,18 +1417,13 @@ fn poll_snapshot(
                 });
             }
             GalaxyEvent::ExplorerKilled { explorer_id } => {
-                // No dedicated visual yet — logged so it's visible during testing.
+                // TODO: death animation. The sprite is hidden by sync_explorers.
                 println!("[gui] Explorer {explorer_id} died with their planet");
             }
             GalaxyEvent::ExplorerMoved {
                 explorer_id, to, ..
             } => {
-                // Queue the real hop rather than relying on the polled
-                // `explorer_planet` position diff — a burst of several real
-                // moves landing between two ~250ms snapshot polls would
-                // otherwise only ever show the *last* one, silently skipping
-                // every real intermediate planet. drive_explorers drains this
-                // queue one hop at a time, in order.
+                // see pending_hops
                 for (tag, mut ea) in &mut explorer_anims {
                     if tag.0 == *explorer_id {
                         ea.pending_hops.push_back(*to);
@@ -1661,11 +1446,8 @@ fn poll_snapshot(
     state.phase_elapsed = snap.phase_elapsed;
 }
 
-/// Clears a stale `Selection` once its target no longer exists (destroyed
-/// planet, dead explorer). Without this, a selected-then-destroyed planet
-/// stayed "selected" forever — every subsequent Sunray/Asteroid press kept
-/// targeting the dead planet id and silently failing with "not found",
-/// which looked exactly like the buttons had stopped working.
+// Unselect planets/explorers that died, otherwise the buttons keep firing at a
+// planet that doesn't exist and it looks like they're broken.
 fn sync_selection_validity(state: Res<GalaxyState>, mut selection: ResMut<Selection>) {
     if !state.ready {
         return;
@@ -1682,12 +1464,9 @@ fn sync_selection_validity(state: Res<GalaxyState>, mut selection: ResMut<Select
     }
 }
 
-// ── Explorer movement ──────────────────────────────────────────────────────────
+// --- Explorers ---
 
-/// Hides an explorer's sprite once it's no longer in the backend snapshot
-/// (killed when their planet was destroyed). Mirrors `sync_planets` — without
-/// this, a dead explorer's sprite just sits frozen on screen forever, since
-/// nothing else despawns or hides it.
+// hide explorers that are gone from the snapshot (died with their planet)
 fn sync_explorers(state: Res<GalaxyState>, mut query: Query<(&ExplorerTag, &mut Visibility)>) {
     if !state.ready {
         return;
@@ -1701,9 +1480,6 @@ fn sync_explorers(state: Res<GalaxyState>, mut query: Query<(&ExplorerTag, &mut 
     }
 }
 
-/// Spawns the (initially hidden) resource-badge sprites for one explorer.
-/// Their image/position/visibility are all driven each frame by
-/// `sync_resource_badges` from the real bag content in `GalaxyState`.
 fn spawn_resource_badges(commands: &mut Commands, explorer_id: u32) {
     for slot in 0..RESOURCE_BADGE_SLOTS {
         commands.spawn((
@@ -1718,11 +1494,6 @@ fn spawn_resource_badges(commands: &mut Commands, explorer_id: u32) {
     }
 }
 
-/// Positions and shows/hides each carried-resource badge above its explorer,
-/// reading the real bag content fetched live from the explorer thread each
-/// snapshot poll. Runs after `drive_explorers` so badges follow the
-/// explorer's current (possibly mid-hop) position rather than lagging a
-/// frame behind.
 fn sync_resource_badges(
     state: Res<GalaxyState>,
     icons: Res<ResourceIcons>,
@@ -1772,10 +1543,8 @@ fn drive_explorers(
 
     let delta = time.delta();
 
-    // Snapshot every explorer's real backend planet up front so the
-    // co-location check below (used by react_other) can see the *other*
-    // explorer's position without a second, nested query over the same
-    // component set.
+    // copied out so the co-location check can see the other explorer
+    // without a second query
     let backend_positions: Vec<(u32, u32)> = state
         .explorer_planet
         .iter()
@@ -1786,32 +1555,18 @@ fn drive_explorers(
         ea.anim_timer.tick(delta);
         let tick = ea.anim_timer.just_finished();
 
-        // Only decide on a new destination while resting — a move already in
-        // flight finishes its own hop first, so real moves get replayed in
-        // order rather than a later one cutting an earlier one short.
+        // finish the current hop before starting the next one
         let can_start_new_move = matches!(
             ea.phase,
             ExplorerPhase::Settled | ExplorerPhase::ReactingOther
         );
 
         if can_start_new_move {
-            // Prefer a queued real hop (from a confirmed `ExplorerMoved`
-            // event) over the raw polled `explorer_planet` position: the
-            // queue preserves every hop in order even if several land between
-            // two ~250ms snapshot polls, where the polled position alone
-            // would only ever show the *last* one and silently skip the rest
-            // — which is exactly what read as "wrong planet, moving too
-            // fast". Falling back to the polled position keeps things working
-            // even if a move event was ever missed for some reason.
-            //
-            // A queued hop's planet can die *after* being queued but *before*
-            // the animation catches up to it (the queue can lag several real
-            // seconds behind during a burst) — animating a full walk to, and
-            // settling on, a planet whose sprite has since been hidden is
-            // exactly what read as "the explorer is standing in empty space."
-            // Skip any now-dead hops instantly (no wasted travel animation to
-            // a place that no longer visually exists) rather than visiting
-            // them.
+            // Use the queued hops first, and fall back to the snapshot
+            // position in case a move event got missed.
+            // Skip hops to planets that died in the meantime (the queue can be
+            // a few seconds behind), otherwise the explorer walks to empty
+            // space and stands there.
             let mut next = None;
             while let Some(bp) = ea.pending_hops.pop_front() {
                 if state.alive.contains(&bp) {
@@ -1851,18 +1606,9 @@ fn drive_explorers(
                         atlas.index += 1;
                     }
                 }
-                // Explorers can't actually talk to each other, but it's a fun
-                // touch to have them notice/react when they end up sharing a
-                // planet — checked every frame against the real backend
-                // positions of every other explorer, edge-triggered so it
-                // fires the instant paths cross rather than on a periodic
-                // sample that could miss a brief overlap.
-                // Compare this explorer's own *real* backend planet (not
-                // `ea.cur_planet`, which can lag several real hops behind
-                // during a burst — see `pending_hops`) against the other
-                // explorer's real backend planet. Comparing a possibly-stale
-                // local value against a live one was why this almost never
-                // fired even when the sprites visually looked adjacent.
+                // Compare backend positions for both explorers. cur_planet can
+                // be a few hops behind (see pending_hops), and using it made
+                // this almost never trigger.
                 let co_located = state.explorer_planet.get(&tag.0).is_some_and(|&my_p| {
                     backend_positions
                         .iter()
@@ -1963,19 +1709,13 @@ fn drive_explorers(
     }
 }
 
-// ── Sunray/asteroid projectiles ────────────────────────────────────────────────
+// --- Sunray / asteroid projectiles ---
 //
-// Real visuals for real events: spawned only from `GalaxyEvent::SunraySent`/
-// `AsteroidSent` (see `poll_snapshot`), traveling from the sending stance to
-// the real target planet's real ring position. The projectile always plays
-// its "impact" frames on arrival regardless of whether the asteroid actually
-// gets deflected. The planet's own hit/receive reaction (already queued
-// separately via `PlanetReactionQueue`) is what shows the real outcome; this
-// just shows something physically crossing the gap, not a claim about who wins.
+// Spawned on SunraySent/AsteroidSent and flown from the stance to the planet.
+// They always play "impact" at the end, even if the asteroid gets deflected.
+// The planet's own hit/receive animation is what shows what happened.
 
-/// World-space units per second a projectile travels, tuned so even the
-/// farthest planet (opposite side of the ring from the sending stance) takes
-/// under 1.5s, keeping pace with the ~25s tick interval.
+// fast enough that the farthest planet takes under 1.5s
 const PROJECTILE_SPEED: f32 = 700.0 * DISPLAY_SCALE;
 const PROJECTILE_MIN_TRAVEL_SECS: f32 = 0.35;
 const PROJECTILE_SIZE: f32 = 40.0 * DISPLAY_SCALE;
@@ -1998,7 +1738,6 @@ struct Projectile {
     impact_range: (usize, usize),
 }
 
-/// Loaded once at startup: image + atlas layout for each projectile sheet.
 #[derive(Resource)]
 struct ProjectileAssets {
     sunray_image: Handle<Image>,
@@ -2030,9 +1769,7 @@ impl ProjectileAssets {
     }
 }
 
-/// Spawns one sunray or asteroid projectile flying from `kind`'s owning
-/// stance (Solace for sunrays, Eclipse for asteroids) to `planet_id`'s real
-/// ring position.
+// sunrays come from Solace, asteroids from Eclipse
 fn spawn_projectile(
     commands: &mut Commands,
     assets: &ProjectileAssets,
@@ -2084,10 +1821,6 @@ fn spawn_projectile(
     ));
 }
 
-/// Drives every in-flight projectile: lerps position from `from` to `to`
-/// while playing the "moving" loop, rotates to face its direction of travel,
-/// then switches to the one-shot "impact" frames on arrival and despawns
-/// once those finish.
 fn drive_projectiles(
     mut commands: Commands,
     time: Res<Time>,
@@ -2136,9 +1869,8 @@ fn drive_projectiles(
     }
 }
 
-// ── Planet death ───────────────────────────────────────────────────────────────
+// --- Planets ---
 
-/// Detects when a planet leaves `alive_planets` and triggers its death animation sequence.
 fn sync_planets(
     state: Res<GalaxyState>,
     tags: Res<AnimTags>,
@@ -2150,9 +1882,6 @@ fn sync_planets(
         &mut Sprite,
     )>,
 ) {
-    // Don't touch anything until the first real snapshot has arrived — the
-    // default-empty `state.alive` before that point would otherwise look
-    // identical to "every planet just died".
     if !state.ready {
         return;
     }
@@ -2163,7 +1892,7 @@ fn sync_planets(
                 if state.alive.contains(&tag.0) {
                     *vis = Visibility::Inherited;
                 } else {
-                    // Planet just died — start dying, then destroyed, then hide.
+                    // just died: play dying, then destroyed, then hide
                     let dying = tags.planet("dying");
                     let destroyed = tags.planet("destroyed");
                     *pstate = PlanetState::Dying;
@@ -2178,13 +1907,12 @@ fn sync_planets(
                     }
                 }
             }
-            // Dying and Dead are managed entirely by drive_planet_anim.
+            // drive_planet_anim takes care of these
             PlanetState::Dying | PlanetState::Dead => {}
         }
     }
 }
 
-/// Drives all planet animations, including the two-phase death sequence.
 fn drive_planet_anim(
     time: Res<Time>,
     tags: Res<AnimTags>,
@@ -2212,7 +1940,7 @@ fn drive_planet_anim(
                     *state = PlanetState::Dead;
                     *vis = Visibility::Hidden;
                 } else if *state == PlanetState::Alive {
-                    // One-shot reaction (hit/receive) finished — return to idle.
+                    // hit/receive finished, back to idle
                     let idle = tags.planet("idle");
                     anim.first = idle.0;
                     anim.last = idle.1;
@@ -2227,7 +1955,6 @@ fn drive_planet_anim(
     }
 }
 
-/// Applies queued hit/receive reactions to alive planets.
 fn drive_planet_reactions(
     mut queue: ResMut<PlanetReactionQueue>,
     mut query: Query<(&PlanetTag, &mut Sprite, &mut AnimationConfig, &PlanetState)>,
@@ -2249,12 +1976,10 @@ fn drive_planet_reactions(
     }
 }
 
-// ── Portrait sync ───────────────────────────────────────────────────────────────
+// --- Portraits ---
 //
-// Both portraits are always visible in their bottom-bar corners. Only the
-// active personality glows at full brightness; the inactive one is dimmed —
-// per the design, this should communicate who's in control without reading
-// any text.
+// Both portraits are always shown, the one in control is brighter so you can
+// tell who it is without reading anything.
 
 const PORTRAIT_ACTIVE_TINT: Color = Color::srgba(1.0, 1.0, 1.0, 1.0);
 const PORTRAIT_DIM_TINT: Color = Color::srgba(0.55, 0.55, 0.6, 0.55);
@@ -2264,8 +1989,7 @@ fn sync_portrait_glow(
     mut query: Query<(&PortraitTag, &mut ImageNode), Without<GlitchOverlay>>,
 ) {
     for (tag, mut image) in &mut query {
-        // Solace owns the calm end (hostility -> 0), Eclipse the hostile end
-        // (hostility -> 1) — crossfading continuously instead of snapping.
+        // fades with hostility instead of switching all at once
         let dominance = match tag.0 {
             Personality::Solace => 1.0 - state.hostility,
             Personality::Eclipse => state.hostility,
@@ -2283,7 +2007,6 @@ fn drive_portraits(
         for (tag, mut sprite, mut cfg) in &mut query {
             if tag.0 == reaction.target {
                 if reaction.priority || cfg.looping {
-                    // Priority reactions (flip) interrupt immediately; idle portraits start at once.
                     if let Some(atlas) = &mut sprite.texture_atlas {
                         cfg.pending.clear();
                         cfg.react(reaction.first, reaction.last, &mut atlas.index);
@@ -2331,9 +2054,6 @@ fn drive_portraits(
     }
 }
 
-/// Shows only the active personality's stance, hiding the other — the shared
-/// body can only physically be standing as one personality at a time, unlike
-/// the portrait bubbles (which are both always on screen, just dimmed).
 fn sync_stance_visibility(
     state: Res<GalaxyState>,
     mut query: Query<(&StanceTag, &mut Visibility)>,
@@ -2347,9 +2067,7 @@ fn sync_stance_visibility(
     }
 }
 
-/// Loops the 4-frame standing-idle animation on whichever stance is currently
-/// visible. Runs unconditionally on both (cheap, and keeps the hidden one's
-/// frame in sync so there's no visible jump the instant it reappears).
+// runs on the hidden one too so it doesn't jump when it appears
 fn drive_stance_anim(time: Res<Time>, mut query: Query<(&mut StanceAnim, &mut ImageNode)>) {
     for (mut anim, mut image) in &mut query {
         anim.timer.tick(time.delta());
@@ -2365,9 +2083,8 @@ fn drive_stance_anim(time: Res<Time>, mut query: Query<(&mut StanceAnim, &mut Im
     }
 }
 
-/// Flashes a portrait's glitch overlay when a manual override "infiltrates"
-/// it, then fades it back out. A single static frame flickered via alpha
-/// jitter reads as a hack landing, at zero extra art cost.
+// One glitch frame, flickered with alpha. Looks like a hack without having to
+// draw a whole animation.
 fn drive_glitch_overlays(
     time: Res<Time>,
     mut glitch: ResMut<GlitchQueue>,
@@ -2395,10 +2112,7 @@ fn drive_glitch_overlays(
     }
 }
 
-/// Fills each personality's suspicion meter to match their live tier.
-/// `apply_manual_override` (called directly from the Sunray/Asteroid button
-/// handlers) is what actually changes the tier and queues portrait
-/// reactions — this system just keeps the little side-stat bar in sync.
+// the tier itself changes in apply_manual_override
 fn sync_suspicion_meter(
     suspicion: Res<SuspicionState>,
     mut query: Query<(&SuspicionMeterFill, &mut Node)>,
@@ -2410,9 +2124,9 @@ fn sync_suspicion_meter(
     }
 }
 
-// ── Generic sprite animation ───────────────────────────────────────────────────
+// --- Other animation ---
 
-/// Drives looping `AnimationConfig` sprites. Planets are excluded — use `drive_planet_anim`.
+// planets have their own (drive_planet_anim)
 fn animate_sprites(
     time: Res<Time>,
     mut query: Query<(&mut Sprite, &mut AnimationConfig), Without<PlanetState>>,
@@ -2433,8 +2147,6 @@ fn animate_sprites(
     }
 }
 
-// ── Connection lines ───────────────────────────────────────────────────────────
-
 fn draw_connections(mut gizmos: Gizmos, state: Res<GalaxyState>) {
     for &(a, b) in CONNECTIONS {
         let pid_a = (a + 1) as u32;
@@ -2452,8 +2164,6 @@ fn draw_connections(mut gizmos: Gizmos, state: Res<GalaxyState>) {
     }
 }
 
-// ── Vignette ──────────────────────────────────────────────────────────────────
-
 fn lerp_color(a: Color, b: Color, t: f32) -> Color {
     let a = a.to_linear();
     let b = b.to_linear();
@@ -2470,9 +2180,8 @@ fn sync_vignette(
     time: Res<Time>,
     mut query: Query<&mut Sprite, With<VignetteTag>>,
 ) {
-    // Kept extremely low on purpose — this is ambient mood lighting, not a
-    // color wash. Solace in particular reads yellow very easily even at low
-    // alpha, so it's cut much further than Eclipse.
+    // Very low alpha on purpose, it's supposed to be subtle. Solace's orange
+    // turns everything yellow really fast so it's even lower.
     let target = match state.personality {
         Personality::Solace => Color::srgba(1.0, 0.55, 0.05, 0.015),
         Personality::Eclipse => Color::srgba(0.25, 0.0, 0.45, 0.04),
@@ -2483,7 +2192,7 @@ fn sync_vignette(
     }
 }
 
-// ── Ambient movement systems ────────────────────────────────────────────────────
+// --- Background ---
 
 fn drive_drift_bob(time: Res<Time>, mut query: Query<(&mut Transform, &DriftBob)>) {
     let t = time.elapsed_secs();
@@ -2521,7 +2230,6 @@ fn drive_twinkle(time: Res<Time>, mut query: Query<(&mut Sprite, &Twinkle)>) {
     }
 }
 
-/// Drives the small drifting stars inside each panel (the "Nebula Glass" effect).
 fn drive_panel_stars(time: Res<Time>, mut query: Query<(&mut Node, &PanelStarBob)>) {
     let t = time.elapsed_secs();
     for (mut node, bob) in &mut query {
@@ -2530,8 +2238,7 @@ fn drive_panel_stars(time: Res<Time>, mut query: Query<(&mut Node, &PanelStarBob
     }
 }
 
-/// Fires roughly every 20-40s: spawns a streak crossing the screen from one
-/// random edge, moving toward roughly the opposite side.
+// one every 20-40 seconds
 fn spawn_shooting_stars(
     time: Res<Time>,
     mut timer: ResMut<ShootingStarTimer>,
@@ -2544,8 +2251,7 @@ fn spawn_shooting_stars(
     }
 
     let mut rng = rand::rng();
-    // The art faces down-left natively. Half the time it travels that way
-    // unflipped; the other half it's mirrored (flip_x) and travels down-right.
+    // the sprite points down-left, flipped it goes down-right
     let flipped = rng.random_bool(0.5);
     let start = Vec2::new(
         rng.random_range(-300.0..500.0),
@@ -2592,7 +2298,6 @@ fn drive_shooting_stars(
     }
 }
 
-/// Custom star cursor following the OS cursor position (which is hidden).
 fn follow_cursor(
     windows: Query<&Window, With<PrimaryWindow>>,
     mut query: Query<&mut Node, With<CursorTag>>,
@@ -2607,14 +2312,13 @@ fn follow_cursor(
     }
 }
 
-// ── User input ──────────────────────────────────────────────────────────────────
+// --- Input ---
 //
-// Left-click an explorer to select it, then left-click one of the neighboring
-// planets (highlighted in green) to move it there. Left-click a planet with no
-// explorer selected to target it for the console's Sunray/Asteroid buttons.
-// Right-click either one to open its hologram (fetches real bag/planet data).
-// Right-click empty space, or the same entity again, to close the hologram.
-// Space toggles the logic loop.
+// Left click explorer, then a green neighbor planet: move there.
+// Left click planet (no explorer selected): target for Sunray/Asteroid.
+// Right click explorer/planet: open hologram. Right click empty space or the
+// same thing again: close it.
+// Space: start/pause logic.
 
 const EXPLORER_HIT_RADIUS: f32 = 28.0 * DISPLAY_SCALE;
 const PLANET_HIT_RADIUS: f32 = 55.0 * DISPLAY_SCALE;
@@ -2637,9 +2341,7 @@ fn handle_input(
         let _ = cmds.0.send(UiCommand::ToggleLogic);
     }
 
-    // Debug-only: E forces hostility toward Eclipse, S forces it toward
-    // Solace — verifies the flip instantly instead of waiting through real
-    // playtime for enough deaths to accumulate.
+    // debug: E pushes to Eclipse, S to Solace
     if keys.just_pressed(KeyCode::KeyE) {
         let _ = cmds.0.send(UiCommand::DebugNudgeHostility(1.0));
     }
@@ -2658,9 +2360,7 @@ fn handle_input(
         return;
     };
 
-    // Only treat clicks inside the cockpit viewport hole as galaxy clicks —
-    // everything else (cockpit chrome, buttons) is handled by its own
-    // Interaction-based systems and shouldn't also fire a sunray/asteroid.
+    // clicks on the cockpit/buttons are handled by their own systems
     if cursor.x < VIEWPORT_HOLE_MIN.x
         || cursor.x > VIEWPORT_HOLE_MAX.x
         || cursor.y < VIEWPORT_HOLE_MIN.y
@@ -2743,9 +2443,8 @@ fn handle_input(
             return;
         }
 
-        // No explorer selected — clicking a planet now just selects it for
-        // the console's Sunray/Asteroid buttons to act on (spaceship-cockpit
-        // theme: the board issues commands, direct clicks just point at things).
+        // no explorer selected: just target the planet, the console buttons
+        // do the actual firing
         selection.planet = if selection.planet == Some(tag.0) {
             None
         } else {
@@ -2754,20 +2453,14 @@ fn handle_input(
         return;
     }
 
-    // Right-click hit nothing inside the viewport — close whatever hologram
-    // is open.
+    // right click on nothing closes the hologram
     if right {
         inspecting.0 = None;
     }
 }
 
-/// Fires a manual sunray or asteroid on `Selection::planet`. The glitch
-/// always flashes on whoever is *currently in control* (`state.personality`)
-/// — a manual override is "infiltrating" the one steering right now,
-/// regardless of whether the action itself is a sunray or an asteroid. It
-/// used to be hardcoded (sunray -> always Solace, asteroid -> always
-/// Eclipse), which meant an asteroid sent while Solace was in control
-/// glitched Eclipse instead of her.
+// The glitch goes on whoever is in control right now, not on "the sunray one"
+// or "the asteroid one", because the player is overriding *her*.
 fn fire_on_selected_planet(
     selection: &Selection,
     cmds: &UiCommands,
@@ -2800,8 +2493,7 @@ fn fire_on_selected_planet(
                 });
             }
         }
-        // Refused: she notices the pattern and shuts it down — the request
-        // never reaches the orchestrator at all.
+        // nothing is sent to the orchestrator
         SuspicionOutcome::Refused => {
             let (first, last) = tags.get(&active, "refusal");
             queue.0.push_back(PortraitReaction {
@@ -2866,8 +2558,6 @@ fn handle_asteroid_button(
     }
 }
 
-/// Shows only the Start/Pause/Resume button matching the current
-/// [`LogicRunState`], and wires each of the three to the same toggle command.
 fn is_active_transport(button: &TransportButton, state: LogicRunState) -> bool {
     matches!(
         (button, state),
@@ -2877,9 +2567,8 @@ fn is_active_transport(button: &TransportButton, state: LogicRunState) -> bool {
     )
 }
 
-/// Full brightness for the active Start/Pause/Resume button; dimmed (but
-/// still visible, not `Display::None`) for the other two — a gap where a
-/// hidden button used to sit read as broken, not "inactive."
+// Inactive buttons are dimmed instead of hidden, an empty gap in the console
+// looked broken.
 const TRANSPORT_INACTIVE_TINT: Color = Color::srgba(0.65, 0.65, 0.65, 1.0);
 
 fn sync_transport_buttons(
@@ -2904,8 +2593,7 @@ fn sync_transport_buttons(
     }
 }
 
-/// Shows/hides each hologram based on `Inspecting`, and only one of the two
-/// at a time (matches the "walls light up one at a time" framing).
+// only one hologram open at a time
 fn sync_hologram_visibility(
     inspecting: Res<Inspecting>,
     mut expl_holo: Query<&mut Visibility, (With<ExplorerHologram>, Without<PlanetHologram>)>,
@@ -2935,8 +2623,6 @@ fn sync_hologram_visibility(
     }
 }
 
-/// Writes the bridge thread's fetched bag/planet-state data into whichever
-/// hologram text is currently showing it.
 fn sync_hologram_content(
     inspection: Res<Inspection>,
     names: Res<PlanetNames>,
@@ -2977,7 +2663,6 @@ fn sync_hologram_content(
     }
 }
 
-/// Toggles the map hologram open/closed when the compass button is pressed.
 fn toggle_map_hologram(
     mut open: ResMut<MapHologramOpen>,
     query: Query<&Interaction, (Changed<Interaction>, With<CompassButtonTag>)>,
@@ -3005,8 +2690,6 @@ fn sync_map_hologram_visibility(
     }
 }
 
-/// Shows a node only while its planet is still alive — same real data
-/// `sync_planets` uses, just read here for the mini-map's own node icons.
 fn sync_map_nodes(state: Res<GalaxyState>, mut query: Query<(&MapNodeTag, &mut Visibility)>) {
     if !state.ready {
         return;
@@ -3020,9 +2703,7 @@ fn sync_map_nodes(state: Res<GalaxyState>, mut query: Query<(&MapNodeTag, &mut V
     }
 }
 
-/// Shows an edge only while both its planets are still alive — mirrors
-/// `draw_connections`'s exact rule (and its "not ready yet, show everything"
-/// fallback before the first real snapshot arrives).
+// same rule as draw_connections
 fn sync_map_edges(state: Res<GalaxyState>, mut query: Query<(&MapEdgeTag, &mut Visibility)>) {
     for (tag, mut vis) in &mut query {
         let (a, b) = CONNECTIONS[tag.0];
@@ -3038,8 +2719,6 @@ fn sync_map_edges(state: Res<GalaxyState>, mut query: Query<(&MapEdgeTag, &mut V
     }
 }
 
-/// Mirrors `update_top_bar_personality`/`update_top_bar_cycle` into one line
-/// inside the map hologram panel.
 fn update_map_clock_text(
     state: Res<GalaxyState>,
     mut query: Query<(&mut Text, &mut TextColor), With<MapClockText>>,
@@ -3056,10 +2735,8 @@ fn update_map_clock_text(
     color.0 = tint;
 }
 
-/// Simple hover feedback for cockpit buttons — brightens on hover, dims on
-/// press. Skips repositioning (buttons are absolute-positioned at an exact
-/// cockpit coordinate; nudging `top` directly would move them, not offset
-/// them, since there's no separate "base position" tracked per button).
+// Only changes color. Moving them on press would need a saved base position
+// since they're placed with absolute coords.
 fn cockpit_button_hover(
     mut query: Query<
         (&Interaction, &mut ImageNode),
@@ -3080,9 +2757,7 @@ fn cockpit_button_hover(
     }
 }
 
-/// Dims Sunray/Asteroid when no planet is selected — pressing them then does
-/// nothing (they only act on `Selection::planet`), which read as a silent,
-/// confusing no-op. Now it's visually obvious nothing will happen.
+// dim Sunray/Asteroid when there's no planet to fire at
 fn sync_action_buttons_enabled(
     selection: Res<Selection>,
     mut query: Query<&mut ImageNode, Or<(With<SunrayButtonTag>, With<AsteroidButtonTag>)>>,
@@ -3097,8 +2772,7 @@ fn sync_action_buttons_enabled(
     }
 }
 
-/// Highlights the selected explorer's current planet and its valid move
-/// destinations (neighbors that are still alive).
+// yellow = where the explorer is, green = where it can go
 fn draw_selection_highlight(
     selection: Res<Selection>,
     state: Res<GalaxyState>,
@@ -3128,7 +2802,7 @@ fn draw_selection_highlight(
     }
 }
 
-// ── Command-center UI: update systems ──────────────────────────────────────────
+// --- Screens / text ---
 
 fn update_top_bar_personality(
     state: Res<GalaxyState>,
@@ -3160,8 +2834,6 @@ fn update_top_bar_cycle(
     **text = format!("Cycle {}", format_mmss(state.phase_elapsed));
 }
 
-/// Re-samples real hostility every [`HOSTILITY_TREND_SAMPLE_SECS`] of wall
-/// time and records which way it moved.
 fn update_hostility_trend(
     time: Res<Time>,
     state: Res<GalaxyState>,
@@ -3200,10 +2872,7 @@ fn update_top_bar_trend(
     };
 }
 
-/// Shows the game-over overlay once the real backend has no explorers left
-/// (see `logic::mod.rs`'s own "All explorers have died" exit condition).
-/// `state.ready` guards the startup window where the default-empty explorer
-/// map would otherwise look identical to this.
+// game ends when all explorers are dead (same check as the logic loop)
 fn sync_game_over_overlay(
     state: Res<GalaxyState>,
     mut query: Query<&mut Visibility, With<GameOverOverlay>>,
@@ -3218,10 +2887,7 @@ fn sync_game_over_overlay(
     };
 }
 
-/// Temporary content for the chronicle screen until the real Cosmic
-/// Chronicle log is built — shows the same overview stats the old "Galaxy
-/// Overview" panel had, plus the current planet/explorer selection, so nothing
-/// useful is lost while the cockpit redesign is in progress.
+// placeholder until the Chronicle log exists (see ChronicleScreenText)
 fn update_chronicle_screen_text(
     state: Res<GalaxyState>,
     selection: Res<Selection>,
@@ -3251,17 +2917,6 @@ fn update_chronicle_screen_text(
     );
 }
 
-/// Builds the docked command-center UI: top bar (phase/cycle/pause), left
-/// panel (expeditions), transparent center spacer (galaxy shows through), and
-/// right panel (galaxy overview + the Solace/Eclipse portraits). Skeleton
-/// pass: static structure and layout, content wired to real state where
-/// cheap, no holographic styling yet.
-/// Builds the spaceship cockpit UI: the whole shell comes from `cockpit.png`
-/// (window frame, top/bottom screens, buttons, chronicle screen), with the
-/// galaxy showing through the transparent viewport hole. Portraits sit in
-/// the upper corners of that viewport; Start/Pause/Resume/Sunray/Asteroid are
-/// real cockpit buttons. Move-explorer and the holograms are not wired yet
-/// (holograms need their own open/close system — next pass).
 fn spawn_cockpit_ui(
     commands: &mut Commands,
     asset_server: &AssetServer,
@@ -3282,9 +2937,7 @@ fn spawn_cockpit_ui(
         None,
         None,
     ));
-    // Both stance sheets are a plain 4-frame idle loop (128x128 per frame,
-    // confirmed against solace_stance.json/eclipse_stance.json's own "stance"
-    // tag, frames 0-3) — one shared layout works for either.
+    // both stance sheets are 4 frames of 128x128
     let stance_layout = layouts.add(TextureAtlasLayout::from_grid(
         UVec2::new(128, 128),
         4,
@@ -3301,19 +2954,14 @@ fn spawn_cockpit_ui(
             ..default()
         })
         .with_children(|root| {
-            // ── Cockpit shell (stacked full-canvas layers, each transparent
-            // except its own art) ──────────────────────────────────────────
-            root.spawn(cockpit_shell_layer(asset_server, 0, 0)); // window frame + walls
-            root.spawn(cockpit_shell_layer(asset_server, 1, 0)); // top screen backdrop
-            root.spawn(cockpit_shell_layer(asset_server, 2, 0)); // bottom console backdrop
-            root.spawn(cockpit_shell_layer(asset_server, 3, 0)); // chronicle screen backdrop
-            // NOTE: no "buttons" (0,1) layer here on purpose — it's the whole
-            // button row pre-rendered with all 6 always showing, which is
-            // exactly what was defeating the Start/Pause/Resume show-only-one
-            // logic below. The individual button layers already have complete
-            // art (icon + label) on their own, so this backdrop is redundant.
+            root.spawn(cockpit_shell_layer(asset_server, 0, 0)); // frame + walls
+            root.spawn(cockpit_shell_layer(asset_server, 1, 0)); // top screen
+            root.spawn(cockpit_shell_layer(asset_server, 2, 0)); // bottom console
+            root.spawn(cockpit_shell_layer(asset_server, 3, 0)); // chronicle screen
+            // Slot (0,1) is skipped on purpose: it has all 6 buttons drawn in
+            // it, which shows Start/Pause/Resume all at once.
 
-            // ── Cockpit buttons ──────────────────────────────────────────────
+            // buttons
             root.spawn((
                 Button,
                 cockpit_button_bundle(asset_server, &BTN_START),
@@ -3339,16 +2987,12 @@ fn spawn_cockpit_ui(
                 cockpit_button_bundle(asset_server, &BTN_ASTEROID),
                 AsteroidButtonTag,
             ));
-            // Move-explorer button: art is wired, click handling is not yet —
-            // moving still works via the existing click-explorer-then-click-
-            // neighbor flow. Left as a Button so a future pass can hook it up.
+            // TODO: Move button doesn't do anything yet, moving is done by
+            // clicking the explorer and then a planet.
             root.spawn((Button, cockpit_button_bundle(asset_server, &BTN_MOVE)));
 
-            // ── Top screen readout ───────────────────────────────────────────
-            // Font sizes intentionally NOT scaled by DISPLAY_SCALE — kept at
-            // their original readable px sizes even though the chrome around
-            // them shrank, since legibility during a presentation matters
-            // more than strict proportion-matching.
+            // top screen
+            // (font sizes aren't multiplied by DISPLAY_SCALE on purpose)
             root.spawn(Node {
                 position_type: PositionType::Absolute,
                 left: Val::Px(0.0),
@@ -3394,13 +3038,8 @@ fn spawn_cockpit_ui(
                 ));
             });
 
-            // ── Chronicle screen placeholder (real log comes later) ──────────
-            // The panel is chamfered (trapezoidal), not a clean rectangle —
-            // confirmed by sampling cockpit.png directly: at local x=345 only
-            // a thin sliver near y=860-870 is opaque, while at x=400 the full
-            // y=760-880 band is opaque. These bounds (430-1200, 760-860) stay
-            // inside the reliably-opaque interior at every x, clear of the
-            // frame and the angled corners.
+            // chronicle screen: it has angled corners, so the text box is
+            // kept inside the part that's fully drawn
             root.spawn((
                 Node {
                     position_type: PositionType::Absolute,
@@ -3422,7 +3061,7 @@ fn spawn_cockpit_ui(
                 ChronicleScreenText,
             ));
 
-            // ── Portrait bubbles — upper corners of the viewport ─────────────
+            // portraits, upper corners
             let solace_idle = tags.get(&Personality::Solace, "idle");
             spawn_portrait_bubble(
                 root,
@@ -3450,18 +3089,8 @@ fn spawn_cockpit_ui(
                 "ECLIPSE",
             );
 
-            // ── Stances — the shared body's single standing presence. Only
-            // one is ever visible (see sync_stance_visibility). Flanking the
-            // ring itself (not the far viewport wall), close to the galaxy —
-            // a godlike figure standing watch, not another corner readout
-            // like the portrait bubbles above.
-            //
-            // Ring math in UI px: world (0,0) is screen center and world y is
-            // up, so world_x -> WINDOW_WIDTH/2 + world_x and world_y ->
-            // WINDOW_HEIGHT/2 - world_y. Planet sprites are 96*DISPLAY_SCALE
-            // wide (48 half-width), so the ring's real visual edge sits
-            // `RING_RADIUS_X + 48*DISPLAY_SCALE` out from center — the stance
-            // sits a further ~48px gap beyond that.
+            // Stances stand right next to the ring, watching over the galaxy.
+            // Position math is in stance_ui_top_left.
             for (image, personality) in [
                 ("solace_stance.png", Personality::Solace),
                 ("eclipse_stance.png", Personality::Eclipse),
@@ -3490,9 +3119,7 @@ fn spawn_cockpit_ui(
                 ));
             }
 
-            // ── Holograms — right-click an explorer/planet to open, right-click
-            // again (or empty space) to close. Left = explorer bag contents,
-            // right = planet energy cell / rocket state.
+            // holograms (hidden until right-click)
             let holo_left_w =
                 (HOLOGRAM_LEFT.local.max.x - HOLOGRAM_LEFT.local.min.x) * DISPLAY_SCALE;
             root.spawn((
@@ -3547,14 +3174,10 @@ fn spawn_cockpit_ui(
                 ));
             });
 
-            // ── Map hologram — compass button + topology overview panel ──────
             spawn_map_hologram(root, asset_server);
 
-            // ── Suspicion meters — top-aligned with the portrait bubbles
-            // (same top y), 30px gap from the bubble frame, on the inner
-            // side toward the galaxy (not the cockpit wall). Top position is
-            // fixed; the bar's own bottom edge is what moves when its size
-            // changes.
+            // suspicion meters, next to the portraits on the side facing the
+            // galaxy
             let suspicion_meter_top = 150.0 * DISPLAY_SCALE;
             spawn_suspicion_meter(
                 root,
@@ -3577,9 +3200,7 @@ fn spawn_cockpit_ui(
                 Personality::Eclipse,
             );
 
-            // ── Game-over overlay: spawned last so it draws above everything
-            // else in the cockpit. Hidden until `sync_game_over_overlay` sees
-            // the real "no explorers left" backend condition.
+            // game over, spawned last so it's on top of everything
             root.spawn((
                 Node {
                     position_type: PositionType::Absolute,
@@ -3620,8 +3241,7 @@ fn spawn_cockpit_ui(
         });
 }
 
-/// Spawns one portrait bubble (frame + animated portrait + glitch overlay +
-/// name label) at `top_left`, sized [`PORTRAIT_BUBBLE_SIZE`].
+// frame + portrait + glitch overlay + name
 #[allow(clippy::too_many_arguments)]
 fn spawn_portrait_bubble(
     root: &mut ChildSpawnerCommands,
@@ -3715,9 +3335,7 @@ fn spawn_portrait_bubble(
     });
 }
 
-/// Spawns one personality's suspicion meter: a static frame image plus a
-/// bottom-anchored colored fill bar whose height `sync_suspicion_meter`
-/// keeps in sync with the real, live `SuspicionState` value.
+// the fill is anchored at the bottom and grows up
 fn spawn_suspicion_meter(
     root: &mut ChildSpawnerCommands,
     asset_server: &AssetServer,
@@ -3761,10 +3379,6 @@ fn spawn_suspicion_meter(
     });
 }
 
-/// Spawns the compass toggle button (fixed top-right corner) and the map
-/// hologram panel it opens: a miniature of the real galaxy topology, built
-/// from the same `CONNECTIONS`/ring layout the main view uses. Node and edge
-/// visibility are driven by real `GalaxyState` (alive planets), not faked.
 fn spawn_map_hologram(root: &mut ChildSpawnerCommands, asset_server: &AssetServer) {
     root.spawn((
         Button,
@@ -3831,7 +3445,7 @@ fn spawn_map_hologram(root: &mut ChildSpawnerCommands, asset_server: &AssetServe
             MapClockText,
         ));
 
-        // Connection lines first so the node icons draw on top of them.
+        // lines first so the nodes draw on top
         for (i, &(a, b)) in CONNECTIONS.iter().enumerate() {
             let pa = map_node_local_pos(a);
             let pb = map_node_local_pos(b);
@@ -3878,7 +3492,7 @@ fn spawn_map_hologram(root: &mut ChildSpawnerCommands, asset_server: &AssetServe
     });
 }
 
-// ── Scene setup ───────────────────────────────────────────────────────────────
+// --- Setup ---
 
 fn setup(
     mut commands: Commands,
@@ -3891,7 +3505,6 @@ fn setup(
 ) {
     commands.spawn(Camera2d);
 
-    // Space background
     commands.spawn((
         Sprite {
             image: asset_server.load("space_bg.png"),
@@ -3901,8 +3514,7 @@ fn setup(
         Transform::from_xyz(0.0, 0.0, -10.0),
     ));
 
-    // Atmospheric tint layer — 1x1 white pixel scaled to fullscreen.
-    // sync_vignette lerps its color between amber (SOLACE) and dark purple (ECLIPSE).
+    // tint over the whole screen (a stretched white pixel), see sync_vignette
     let white_px = images.add(Image::new_fill(
         Extent3d {
             width: 1,
@@ -3925,7 +3537,7 @@ fn setup(
         VignetteTag,
     ));
 
-    // Stars — 150 instances, deterministic scatter
+    // fixed pseudo-random positions so the sky looks the same every run
     let star_tex = asset_server.load("star.png");
     for i in 0..150_u32 {
         let x = ((i.wrapping_mul(7919).wrapping_add(13)) % WINDOW_WIDTH as u32) as f32
@@ -3942,10 +3554,8 @@ fn setup(
         ));
     }
 
-    // Nebula clouds — one warm variant tied to Solace, one purple tied to
-    // Eclipse. Both are always present; sync_nebula_personality crossfades
-    // between them based on which personality is active. Each drifts slowly
-    // via DriftBob so the "static illustration" still feels alive.
+    // orange nebula = Solace, purple = Eclipse, crossfaded by
+    // sync_nebula_personality
     for (file, personality, base) in [
         (
             "orange_nebula.png",
@@ -3982,8 +3592,7 @@ fn setup(
         ));
     }
 
-    // A third nebula, not tied to either personality — always present at a
-    // low, constant alpha, drifting independently in the background.
+    // pastel and pink nebulas are just decoration, always faintly visible
     let pastel_base = Vec2::new(0.0, 120.0) * DISPLAY_SCALE;
     commands.spawn((
         Sprite {
@@ -4002,9 +3611,6 @@ fn setup(
         },
     ));
 
-    // A fourth nebula variant, same treatment as pastel — always present,
-    // independent of personality, placed at a different corner so it doesn't
-    // overlap the pastel one.
     let pink_base = Vec2::new(-260.0, -140.0) * DISPLAY_SCALE;
     commands.spawn((
         Sprite {
@@ -4023,8 +3629,7 @@ fn setup(
         },
     ));
 
-    // Big flashing stars — a handful of bright twinkle accents, distinct from
-    // the plain star field above.
+    // a few bigger twinkling stars
     let big_star_tex = asset_server.load("big_star.png");
     for i in 0..12_u32 {
         let x = ((i.wrapping_mul(5237).wrapping_add(101)) % WINDOW_WIDTH as u32) as f32
@@ -4048,7 +3653,6 @@ fn setup(
         ));
     }
 
-    // Custom cursor — OS cursor hidden, this small sprite follows the mouse.
     if let Ok(mut cursor_options) = primary_cursor.single_mut() {
         cursor_options.visible = false;
     }
@@ -4076,7 +3680,6 @@ fn setup(
         CursorTag,
     ));
 
-    // Planets — 28 frames, 48x48, idle 0-7 at 10fps
     let planet_layout = layouts.add(TextureAtlasLayout::from_grid(
         UVec2::new(48, 48),
         28,
@@ -4114,10 +3717,8 @@ fn setup(
         ));
     }
 
-    // Portraits now live as small ImageNode entries docked in the bottom bar —
-    // see spawn_command_ui. Their TextureAtlasLayout handles are built there.
-
-    // JEB — id 2, 20 frames, 48x48, starts on planet 1
+    // Jeb is id 2 and starts on planet 1, Viviana is id 1 and starts on
+    // planet 4 (same as builder.rs)
     let jeb_layout = layouts.add(TextureAtlasLayout::from_grid(
         UVec2::new(48, 48),
         20,
@@ -4142,7 +3743,6 @@ fn setup(
     ));
     spawn_resource_badges(&mut commands, 2);
 
-    // VIVIANA — id 1, 24 frames, 48x48, starts on planet 4
     let viv_layout = layouts.add(TextureAtlasLayout::from_grid(
         UVec2::new(48, 48),
         24,

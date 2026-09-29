@@ -1,4 +1,6 @@
-/// Which orchestrator personality is currently in control.
+// Types the orchestrator sends to the GUI. Kept in their own crate so the GUI
+// doesn't need to depend on common-game.
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Personality {
     #[default]
@@ -6,9 +8,7 @@ pub enum Personality {
     Eclipse,
 }
 
-/// Mirrors `common_game::components::resource::ResourceType` without pulling
-/// that crate into this dependency-free shared crate. The orchestrator maps
-/// the real type onto this one in `snapshot::build`.
+// Copy of common_game's ResourceType, snapshot::build converts between them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ResourceKind {
     Oxygen,
@@ -22,9 +22,6 @@ pub enum ResourceKind {
     Dolphin,
 }
 
-/// One explorer's current position and real carried-resource bag content
-/// (fetched live from the explorer via `OrchestratorApi::bag_content`, not
-/// guessed from GUI-side state).
 #[derive(Clone, Debug)]
 pub struct ExplorerSnapshot {
     pub id: u32,
@@ -32,7 +29,6 @@ pub struct ExplorerSnapshot {
     pub bag: Vec<(ResourceKind, usize)>,
 }
 
-/// A discrete event that fired during one logic tick.
 #[derive(Clone, Debug)]
 pub enum GalaxyEvent {
     SunraySent {
@@ -60,18 +56,17 @@ pub enum GalaxyEvent {
     },
 }
 
-/// Full state of the galaxy, updated ~4 times per second by the bridge thread.
+// Built by the bridge thread about 4 times a second.
 #[derive(Clone, Debug, Default)]
 pub struct GalaxySnapshot {
     pub personality: Personality,
-    /// Global hostility in `[0.0, 1.0]`; drives the Solace/Eclipse crossfade.
+    // 0.0 - 1.0, drives the Solace/Eclipse crossfade
     pub hostility: f64,
     pub phase_elapsed: f64,
     pub alive_planets: Vec<u32>,
     pub explorers: Vec<ExplorerSnapshot>,
-    /// Events that fired since the last snapshot. Drained on each poll.
+    // events since the last snapshot, the GUI takes them out when it reads
     pub events: Vec<GalaxyEvent>,
-    /// Current live adjacency: planet id -> its currently-alive neighbor ids.
-    /// The real topology, not a hardcoded ring — shrinks as planets die.
+    // planet id -> alive neighbors (shrinks when planets die)
     pub neighbors: std::collections::HashMap<u32, Vec<u32>>,
 }

@@ -1,18 +1,4 @@
-# Planet factory configuration
-# Maps each planet ID in galaxy.txt to the group that implements it.
-#
-# Format:  <planet_id> = "<factory_name>"
-#
-# Valid factory names (uncomment in factories/mod.rs as you integrate them):
-#   "orbitron"
-#   "skycartel"
-#   "rustrelli"
-#   "thecompilerstrikesback"
-#   "crabtorio"
-#   "houstonwehaveaborrow"
-#   "enterprise"
-#
-# Example (matches the 7-planet ring in galaxy.txt):
+# Which planet (group) is at each id in galaxy.txt
 [planets]
 1 = "orbitron"
 2 = "skycartel"

@@ -1,12 +1,6 @@
-# Galaxy initialization file
-# Format: planet_id neighbor_id neighbor_id ...
-# Connections are bidirectional. No repetitions per line.
-# Planet IDs must be unique unsigned integers.
-#
-# Circulant topology C7(1,2): each planet connects to its two ring
-# neighbors (distance 1) AND the two planets two steps away (distance 2) —
-# 14 edges total instead of the old plain 7-edge ring, so explorers have
-# real alternate routes instead of one fixed loop.
+# planet_id neighbor_id neighbor_id ...
+# Each planet is connected to the next two and the previous two in the ring,
+# so explorers have more than one way to get somewhere.
 1 2 7 3 6
 2 3 1 4 7
 3 4 2 5 1
