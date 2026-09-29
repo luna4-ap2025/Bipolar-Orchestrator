@@ -1,13 +1,8 @@
-//! # Interactive command parsing
-//!
-//! Parses strings typed in the interactive loop into typed [`Command`] values.
-//!
-//! ## Owner: Vivi
+//! Turns what the user types in the CLI into a [`Command`].
 
 use common_game::components::resource::{BasicResourceType, ComplexResourceType};
 use common_game::utils::ID;
 
-/// A parsed interactive command.
 #[derive(Debug, PartialEq)]
 pub enum Command {
     Start,
@@ -44,11 +39,9 @@ pub enum Command {
     Quit,
 }
 
-/// Parses a trimmed input line into a [`Command`].
-///
 /// # Errors
-/// Returns a human-readable error string if the command is unknown or
-/// arguments are missing or malformed.
+/// A message for the user if the command doesn't exist or its arguments are
+/// missing or wrong.
 pub fn parse(input: &str) -> Result<Command, String> {
     let mut parts = input.split_whitespace();
     let verb = parts.next().unwrap_or("").to_lowercase();

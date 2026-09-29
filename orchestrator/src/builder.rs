@@ -12,18 +12,13 @@ use common_game::protocols::planet_explorer::PlanetToExplorer;
 use crossbeam_channel::unbounded;
 use std::collections::HashMap;
 
-/// Parses `galaxy_src` and `planets_src`, spawns all planets and both
-/// explorers, and returns a ready-to-use `OrchestratorApi`.
-///
-/// - Jeb (id 2) starts on planet 1.
-/// - Viviana (id 1) starts on planet 4.
+/// Reads the galaxy and planet config, spawns all the planets and both
+/// explorers (Viviana, id 1, on planet 4 and Jeb, id 2, on planet 1).
 ///
 /// # Panics
-/// If `galaxy_src` or `planets_src` is malformed, or if the [`Forge`]
-/// singleton has already been created in this process. These are treated as
-/// unrecoverable startup errors: this function is only ever called once, at
-/// process start, so there is no meaningful way to continue with an invalid
-/// galaxy definition.
+/// If one of the files is wrong, a planet can't be created, or the `Forge`
+/// was already created. It only runs once at startup, and there's no way to
+/// play with a broken galaxy anyway.
 #[must_use]
 pub fn build_api(galaxy_src: &str, planets_src: &str) -> OrchestratorApi {
     let topology = galaxy::parser::parse_str(galaxy_src).expect("invalid galaxy source");
@@ -55,7 +50,7 @@ pub fn build_api(galaxy_src: &str, planets_src: &str) -> OrchestratorApi {
         unbounded::<crate::explorer::handle::ExplorerToOrchestratorMsg>();
     let mut explorer_registry = ExplorerRegistry::new();
 
-    // Viviana — id 1, starts on planet 4 (ring index 3)
+    // Viviana
     {
         let (tx_to_viv, rx_from_orch) = unbounded::<OrchestratorToExplorer>();
         let (planet_reply_tx, rx_from_planet) = unbounded::<PlanetToExplorer>();
@@ -85,7 +80,7 @@ pub fn build_api(galaxy_src: &str, planets_src: &str) -> OrchestratorApi {
         ));
     }
 
-    // Jeb — id 2, starts on planet 1 (ring index 0)
+    // Jeb
     {
         let (tx_to_jeb, rx_from_orch) = unbounded::<OrchestratorToExplorer>();
         let (planet_reply_tx, rx_from_planet) = unbounded::<PlanetToExplorer>();

@@ -1,8 +1,4 @@
-//! # Orbitron planet factory
-//!
-//! Wraps the `orbitron` crate's planet constructor in the [`PlanetFactory`] trait.
-//!
-//! ## Owner: Vale
+//! Orbitron.
 
 use super::PlanetFactory;
 use common_game::components::planet::Planet;
@@ -11,7 +7,6 @@ use common_game::protocols::planet_explorer::ExplorerToPlanet;
 use common_game::utils::ID;
 use crossbeam_channel::{Receiver, Sender};
 
-/// Factory for the Orbitron planet (group: Orbitron).
 pub struct OrbitronFactory;
 
 impl PlanetFactory for OrbitronFactory {

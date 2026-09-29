@@ -1,7 +1,4 @@
-//! # Bipolar Orchestrator - library root
-//!
-//! Re-exports all public modules so integration tests and the visualizer
-//! can depend on this crate as a library.
+//! Library part of the orchestrator, so the GUI can use it too.
 
 pub mod ack;
 pub mod api;

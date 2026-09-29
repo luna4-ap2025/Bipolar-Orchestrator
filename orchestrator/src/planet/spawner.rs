@@ -1,9 +1,5 @@
-//! # Planet spawner
-//!
-//! Creates channels, calls the correct planet factory, and launches the planet
-//! thread. Returns a [`PlanetHandle`] to the orchestrator.
-//!
-//! ## Owner: Vivi
+//! Creates a planet's channels, builds it with its group's factory and runs
+//! it in its own thread.
 
 use super::PlanetHandle;
 use super::factories::PlanetFactory;
@@ -12,31 +8,15 @@ use common_game::protocols::orchestrator_planet::PlanetToOrchestrator;
 use common_game::utils::ID;
 use crossbeam_channel::{Sender, unbounded};
 
-/// All the channel ends the orchestrator keeps after spawning a planet.
+// TODO: not used anywhere, remove
 pub struct SpawnedPlanetChannels {
-    /// Receiver for all messages coming from all planets (shared single receiver).
-    /// The orchestrator already owns this; this field is not included here.
-    /// Instead the planet's *sender* half is given to the planet thread.
-    ///
-    /// This struct only carries the `PlanetToOrchestrator` sender so the planet
-    /// thread can send back to the orchestrator.
-    ///
-    /// Actually see design note below.
     _note: (),
 }
 
-/// Spawns a planet by:
-/// 1. Creating the orchestrator↔planet channels.
-/// 2. Creating the explorer→planet channel (one shared receiver per planet).
-/// 3. Calling the correct factory function (dispatched by `factory`).
-/// 4. Launching a thread that calls `planet.run()`.
-/// 5. Returning a [`PlanetHandle`] to the caller.
-///
-/// The `orch_tx` parameter is the **shared** sender used by **all** planets to
-/// send messages back to the orchestrator (the orchestrator owns the single receiver).
+/// `orch_tx` is the sender all planets share to talk to the orchestrator.
 ///
 /// # Errors
-/// Returns [`OrchestratorError::PlanetConstructionError`] if the factory fails.
+/// `PlanetConstructionError` if the factory fails or the thread can't start.
 pub fn spawn_planet(
     id: ID,
     label: impl Into<String>,
@@ -45,19 +25,16 @@ pub fn spawn_planet(
 ) -> Result<PlanetHandle, OrchestratorError> {
     let label = label.into();
 
-    // one dedicated channel per planet so we can target it specifically
+    // one channel per planet so we can send to a specific one
     let (tx_to_planet, rx_from_orch) = unbounded();
 
-    // all explorers currently on this planet share one sender to reach it
-    // we clone tx_explorer_to_planet and hand the clone to each explorer that visits
+    // explorers get a clone of this sender when they move here
     let (tx_explorer_to_planet, rx_from_explorers) = unbounded();
 
-    // call the planet group's factory to get the Planet struct
     let mut planet = factory
         .create(id, rx_from_orch, orch_tx, rx_from_explorers)
         .map_err(OrchestratorError::PlanetConstructionError)?;
 
-    // spawn the planet in its own thread
     let label_clone = label.clone();
     let thread_handle = std::thread::Builder::new()
         .name(format!("planet-{id}-{label_clone}"))

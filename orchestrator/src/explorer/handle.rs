@@ -1,10 +1,5 @@
-//! # Explorer handle
-//!
-//! [`ExplorerHandle`] is the orchestrator's bookkeeping for one live explorer.
-//! It holds the sender to the explorer thread and tracks which planet the
-//! explorer is currently on.
-//!
-//! ## Owner: Vivi
+//! What the orchestrator keeps for each explorer: the sender to its thread
+//! and the planet it's on.
 
 use common_game::components::resource::ResourceType;
 use common_game::protocols::orchestrator_explorer::{
@@ -14,50 +9,33 @@ use common_game::protocols::planet_explorer::PlanetToExplorer;
 use common_game::utils::ID;
 use crossbeam_channel::Sender;
 
-/// The bag content type used by the orchestrator.
-///
-/// It must match the explorer's `BagContentResponse` type.
-/// The explorer sends a summary of resource types and quantities:
-/// `Vec<(ResourceType, usize)>`.
+/// Resource type and how many, the same type our explorers send in
+/// `BagContentResponse`.
 pub type BagContent = Vec<(ResourceType, usize)>;
 
-/// Type alias for the concrete `ExplorerToOrchestrator` message used by the orchestrator.
 pub type ExplorerToOrchestratorMsg = ExplorerToOrchestrator<BagContent>;
 
-/// The orchestrator's bookkeeping for one live explorer.
 pub struct ExplorerHandle {
-    /// Unique identifier of this explorer.
     id: ID,
-
-    /// Sender used to deliver messages to the explorer thread.
     sender: Sender<OrchestratorToExplorer>,
 
-    /// Sender used by planets to reply directly to this explorer.
-    ///
-    /// This sender is created once when the explorer is spawned.
-    /// The explorer keeps the matching `Receiver<PlanetToExplorer>` permanently.
+    // Planets use this to answer the explorer. It's made once at spawn and
+    // passed to each new planet when the explorer moves.
     planet_reply_tx: Sender<PlanetToExplorer>,
 
-    /// The ID of the planet the explorer is currently on.
-    /// Updated by the router after every successful move.
+    // updated after every move
     current_planet: ID,
 
-    /// Most recent `BagContentResponse` the logic loop's regular drain has
-    /// seen for this explorer. Populated asynchronously (see
-    /// `logic::event_handler::handle_one`) rather than fetched with a
-    /// blocking round-trip: a blocking wait on the shared explorer channel
-    /// would risk swallowing a real autonomous message (`NeighborsRequest`,
-    /// `TravelToPlanetRequest`) meant for the logic loop, which is exactly
-    /// what happened when the GUI's per-poll snapshot used to call
-    /// `OrchestratorApi::bag_content` directly.
+    // Last bag the logic loop received. It's stored instead of asked for,
+    // because waiting for an answer on the shared explorer channel could eat
+    // messages meant for the logic loop (this happened when the GUI called
+    // bag_content every snapshot).
     last_bag: BagContent,
 
-    /// Join handle for the explorer thread.
     thread_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ExplorerHandle {
-    /// Constructs a new `ExplorerHandle`.
     #[must_use]
     pub fn new(
         id: ID,
@@ -76,54 +54,44 @@ impl ExplorerHandle {
         }
     }
 
-    /// Returns the explorer's unique ID.
     #[must_use]
     pub fn id(&self) -> ID {
         self.id
     }
 
-    /// Returns the ID of the planet the explorer is currently on.
     #[must_use]
     pub fn current_planet(&self) -> ID {
         self.current_planet
     }
 
-    /// Updates the current planet ID after a successful move.
     pub fn set_current_planet(&mut self, planet_id: ID) {
         self.current_planet = planet_id;
     }
 
-    /// Returns the last `BagContentResponse` the logic loop's drain has
-    /// recorded for this explorer (empty until the first one arrives).
+    /// Empty until the first `BagContentResponse` arrives.
     #[must_use]
     pub fn bag(&self) -> &BagContent {
         &self.last_bag
     }
 
-    /// Records a fresh `BagContentResponse`, called only from the logic
-    /// loop's own drain of `explorer_rx` — never from a second concurrent
-    /// reader of that channel.
+    /// Only called by the logic loop when it reads a `BagContentResponse`.
     pub fn set_bag(&mut self, bag: BagContent) {
         self.last_bag = bag;
     }
 
-    /// Returns the sender that planets use to reply to this explorer.
     #[must_use]
     pub fn planet_reply_tx(&self) -> Sender<PlanetToExplorer> {
         self.planet_reply_tx.clone()
     }
 
-    /// Sends a message to the explorer thread.
-    ///
     /// # Errors
-    /// Returns an error string if the explorer thread has disconnected.
+    /// If the explorer thread is gone.
     pub fn send(&self, msg: OrchestratorToExplorer) -> Result<(), String> {
         self.sender
             .send(msg)
             .map_err(|_| format!("Explorer {} disconnected", self.id))
     }
 
-    /// Waits for the explorer thread to finish.
     pub fn join(&mut self) {
         if let Some(handle) = self.thread_handle.take()
             && let Err(e) = handle.join()

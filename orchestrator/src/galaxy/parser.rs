@@ -1,25 +1,6 @@
-//! # Galaxy file parser
-//!
-//! Reads the galaxy initialization file and produces a [`Topology`].
-//!
-//! ## File format
-//! - One line per planet.
-//! - Each line: `<planet_id> [<neighbor_id> ...]`
-//! - Lines beginning with `#` are comments and are ignored.
-//! - Connections are **bidirectional**: listing `B` as a neighbor of `A`
-//!   automatically implies `A` is also a neighbor of `B`.
-//! - Blank lines are ignored.
-//!
-//! ## Example
-//! ```text
-//! # Ring of 4 planets
-//! 1 2 4
-//! 2 1 3
-//! 3 2 4
-//! 4 3 1
-//! ```
-//!
-//! ## Owner: Vale
+//! Reads galaxy.txt. One line per planet: `<planet_id> <neighbor_id> ...`.
+//! Connections go both ways, so if 1 lists 2, 2 is also connected to 1.
+//! Empty lines and lines starting with `#` are skipped.
 
 use crate::error::OrchestratorError;
 use crate::galaxy::topology::Topology;
@@ -27,12 +8,9 @@ use common_game::utils::ID;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-/// Parses the galaxy initialization file at `path` and returns a [`Topology`].
-///
 /// # Errors
-/// Returns [`OrchestratorError::GalaxyFileError`] if the file cannot be read,
-/// if any line contains a non-integer token, or if a planet lists itself as its
-/// own neighbor.
+/// `GalaxyFileError` if the file can't be read, a token isn't a number, or a
+/// planet lists itself as a neighbor.
 pub fn parse(path: impl AsRef<Path>) -> Result<Topology, OrchestratorError> {
     let content = std::fs::read_to_string(path.as_ref()).map_err(|e| {
         OrchestratorError::GalaxyFileError(format!("Cannot read {}: {e}", path.as_ref().display()))
@@ -41,25 +19,22 @@ pub fn parse(path: impl AsRef<Path>) -> Result<Topology, OrchestratorError> {
     parse_str(&content)
 }
 
-/// Parses galaxy topology from a string (useful for testing without a real file).
+/// Same as [`parse`] but from a string (used by the GUI and the tests).
 ///
 /// # Errors
 /// See [`parse`].
 pub fn parse_str(content: &str) -> Result<Topology, OrchestratorError> {
-    // adjacency map: planet_id → set of neighbor ids
     let mut adjacency: HashMap<ID, HashSet<ID>> = HashMap::new();
 
     for (line_no, raw_line) in content.lines().enumerate() {
         let line = raw_line.trim();
 
-        // skip blank lines and comments
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
 
         let mut tokens = line.split_whitespace();
 
-        // first token is the planet id
         let planet_id: ID = tokens
             .next()
             .ok_or_else(|| {
@@ -76,7 +51,7 @@ pub fn parse_str(content: &str) -> Result<Topology, OrchestratorError> {
                 ))
             })?;
 
-        // ensure the planet has an entry even if it has no neighbors
+        // so planets with no neighbors still exist
         adjacency.entry(planet_id).or_default();
 
         // remaining tokens are neighbor ids

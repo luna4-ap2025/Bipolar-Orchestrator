@@ -1,5 +1,5 @@
-//! # `TheCompilerStrikesBack` planet factory — generates Silicon, combines Robot/AIPartner/Diamond
-//! ## Owner: Vale
+//! The Compiler Strikes Back: generates Silicon, combines Robot, AI partner
+//! and Diamond.
 
 use super::PlanetFactory;
 use common_game::components::planet::Planet;

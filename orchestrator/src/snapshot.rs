@@ -1,13 +1,13 @@
+//! Builds the `GalaxySnapshot` the GUI reads (about 4 times a second).
+
 use crate::api::OrchestratorApi;
 use crate::probability::OrchestratorEvent;
 use bipolar_shared::{ExplorerSnapshot, GalaxyEvent, GalaxySnapshot, Personality, ResourceKind};
 use common_game::components::resource::{BasicResourceType, ComplexResourceType, ResourceType};
 use common_game::protocols::orchestrator_explorer::OrchestratorToExplorer;
 
-/// Maps the real explorer-bag resource type onto the shared, dependency-free
-/// `ResourceKind` the GUI reads. `AIPartner` has no GUI icon asset (it isn't
-/// reachable via this galaxy's recipes) and is dropped rather than faked with
-/// a placeholder.
+// AIPartner is skipped: it can't be made with our planets, so there's no icon
+// for it.
 fn resource_kind(rt: ResourceType) -> Option<ResourceKind> {
     match rt {
         ResourceType::Basic(BasicResourceType::Oxygen) => Some(ResourceKind::Oxygen),
@@ -23,13 +23,11 @@ fn resource_kind(rt: ResourceType) -> Option<ResourceKind> {
     }
 }
 
-/// Reads the current game state from the API's shared registries without
-/// sending any channel messages. Safe to call from a background thread
-/// while the logic loop is running.
+/// Reads the current state without waiting on any channel, so it can run
+/// while the logic loop is going.
 ///
 /// # Panics
-/// If an internal registry mutex is poisoned (a prior panic occurred while
-/// another thread held the lock).
+/// If a mutex is poisoned.
 #[must_use]
 pub fn build(api: &OrchestratorApi) -> GalaxySnapshot {
     let (alive_planets, neighbors) = {
@@ -39,16 +37,10 @@ pub fn build(api: &OrchestratorApi) -> GalaxySnapshot {
         (ids, neighbors)
     };
 
-    // Bag content is read from each handle's cache (last `BagContentResponse`
-    // the logic loop's own drain has seen — see `ExplorerHandle::bag`) rather
-    // than fetched with a blocking round-trip on `explorer_rx`. That channel
-    // is also where autonomous `NeighborsRequest`/`TravelToPlanetRequest`
-    // messages arrive, and a second blocking reader competing for them would
-    // (and, before this fix, did) silently swallow those as "stray" acks,
-    // stalling explorer movement. A fresh `BagContentRequest` is still fired
-    // every poll — just fire-and-forget, so it costs a channel *send*, not a
-    // wait — and its reply gets cached by `event_handler::handle_one` the
-    // next time the logic loop drains (asynchronously, no lock contention).
+    // Uses the last bag the logic loop received (see ExplorerHandle::bag).
+    // Waiting for the answer here ate the explorers' travel requests and they
+    // got stuck. We still ask for a new bag each time, but don't wait: the
+    // logic loop stores the answer when it arrives.
     let explorers = {
         let reg = api.explorers.lock().unwrap();
         reg.iter()

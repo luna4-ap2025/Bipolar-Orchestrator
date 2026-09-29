@@ -1,35 +1,20 @@
-//! # Ack matching helper
-//!
-//! `dispatch_to_planet` (the autonomous logic loop), `send_sunray`, and
-//! `send_asteroid` (manual API calls, e.g. from the GUI) all wait on the same
-//! shared `Receiver<PlanetToOrchestrator>`. A message meant for one call can
-//! otherwise be misread as the ack another call is waiting for — for example
-//! a `KillPlanetResult` left behind after a planet died was being misread as
-//! the next tick's `AsteroidAck`, silently corrupting state. The same class of
-//! bug hits the shared `Receiver<ExplorerToOrchestrator>`: `stop_logic` used to
-//! fire `StopExplorerAI` without waiting for its ack, and a later
-//! `start_logic`'s explorer-ack wait would then pick up that stray
-//! `StopExplorerAIResult` and hard-error instead of ignoring it.
-//!
-//! [`recv_ack`] waits for a message that `matches` accepts, discarding
-//! (and logging) anything else, until the overall `timeout` elapses. Generic
-//! over the message type so it works for both the planet and explorer channels.
+//! The logic loop and the manual API calls all read from the same planet
+//! receiver (and the same explorer receiver), so the next message isn't
+//! always the ack you're waiting for. For example a leftover
+//! `KillPlanetResult` got read as the next `AsteroidAck`. `recv_ack` skips
+//! messages until it finds the right one.
 
 use crate::error::OrchestratorError;
 use crossbeam_channel::Receiver;
 use std::fmt::Debug;
 use std::time::{Duration, Instant};
 
-/// Waits up to `timeout` (total, not per-message) for a message accepted by
-/// `matches`. Non-matching messages are discarded and logged rather than
-/// being treated as the expected ack.
-///
-/// `matches` returns `Ok(value)` to accept the message and stop waiting, or
-/// `Err(message)` to hand the (unmatched) message back so it can be logged.
+/// Waits for a message that `matches` accepts (`Ok`), logging and skipping
+/// the others (`Err` gives the message back). `timeout` is for the whole
+/// wait, not per message.
 ///
 /// # Errors
-/// Returns [`OrchestratorError::ChannelError`] if no matching message arrives
-/// before the deadline, or if the channel disconnects.
+/// `ChannelError` on timeout or if the channel is disconnected.
 pub(crate) fn recv_ack<M: Debug, T>(
     rx: &Receiver<M>,
     timeout: Duration,

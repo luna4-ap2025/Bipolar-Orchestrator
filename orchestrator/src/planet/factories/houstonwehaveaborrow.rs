@@ -1,15 +1,9 @@
-//! # Houston We Have A Borrow planet factory — Type A, configurable resource + rocket strategy
+//! Houston We Have A Borrow (type A). Their constructor also takes a
+//! `RocketStrategy` and which basic resource to generate. We use the default
+//! strategy and `None` (Hydrogen).
 //!
-//! The crate exposes `houston_we_have_a_borrow()` with two extra params:
-//! - `RocketStrategy` — how aggressively to build/reload rockets
-//! - `basic_resource` — which single basic resource this planet generates
-//!
-//! We default to `RocketStrategy::Default` and `None` (crate default: Hydrogen).
-//!
-//! Note: the dependency crate is named `Planet` (capital P), which conflicts with
-//! `common_game::components::planet::Planet`. We avoid the conflict by using full paths.
-//!
-//! ## Owner: Vale
+//! Their crate is called `Planet`, same name as `common_game`'s `Planet`, so
+//! full paths are used here.
 
 use super::PlanetFactory;
 use common_game::protocols::orchestrator_planet::{OrchestratorToPlanet, PlanetToOrchestrator};

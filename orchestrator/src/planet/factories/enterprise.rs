@@ -1,5 +1,4 @@
-//! # Enterprise planet factory — generates Carbon, combines all complex resources
-//! ## Owner: Vale
+//! Enterprise: generates Carbon, can combine every complex resource.
 
 use super::PlanetFactory;
 use common_game::components::planet::Planet;

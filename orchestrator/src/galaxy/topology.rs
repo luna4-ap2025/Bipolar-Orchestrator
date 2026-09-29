@@ -1,43 +1,30 @@
-//! # Galaxy topology
-//!
-//! Stores the live adjacency map of the galaxy and provides query methods.
-//! The topology is **mutable**: planets can be permanently removed when destroyed.
-//!
-//! ## Owner: Vale
+//! Which planets are alive and who they're connected to. Destroyed planets
+//! get removed.
 
 use common_game::utils::ID;
 use std::collections::{HashMap, HashSet};
 
-/// Bidirectional adjacency map of the galaxy.
-///
-/// Constructed by [`super::parser::parse`]. Planets are removed via
-/// [`Topology::remove_planet`] when they are destroyed by an asteroid.
 pub struct Topology {
-    /// `planet_id → set of live neighbor ids`
+    // planet -> alive neighbors
     adjacency: HashMap<ID, HashSet<ID>>,
 }
 
 impl Topology {
-    /// Constructs a `Topology` from a raw adjacency map.
-    ///
-    /// Intended to be called only by [`super::parser::parse_str`].
     pub(super) fn from_adjacency(adjacency: HashMap<ID, HashSet<ID>>) -> Self {
         Self { adjacency }
     }
 
-    /// Returns the IDs of all currently alive planets.
+    /// Ids of the planets that are still alive.
     pub fn planet_ids(&self) -> impl Iterator<Item = ID> + '_ {
         self.adjacency.keys().copied()
     }
 
-    /// Returns `true` if the planet with `id` is still alive in the galaxy.
     #[must_use]
     pub fn contains(&self, id: ID) -> bool {
         self.adjacency.contains_key(&id)
     }
 
-    /// Returns the neighbor IDs of `planet_id`, or an empty slice if the planet
-    /// does not exist.
+    /// Empty if the planet doesn't exist.
     #[must_use]
     pub fn neighbors(&self, planet_id: ID) -> Vec<ID> {
         self.adjacency
@@ -46,16 +33,13 @@ impl Topology {
             .unwrap_or_default()
     }
 
-    /// Returns `true` if `a` and `b` are neighbors.
     #[must_use]
     pub fn are_neighbors(&self, a: ID, b: ID) -> bool {
         self.adjacency.get(&a).is_some_and(|s| s.contains(&b))
     }
 
-    /// Permanently removes `planet_id` from the galaxy, also removing it from
-    /// every neighbor's adjacency set.
-    ///
-    /// Has no effect if the planet is already absent.
+    /// Removes the planet and all its connections. Does nothing if it's
+    /// already gone.
     pub fn remove_planet(&mut self, planet_id: ID) {
         if let Some(neighbors) = self.adjacency.remove(&planet_id) {
             for neighbor in neighbors {
@@ -66,7 +50,6 @@ impl Topology {
         }
     }
 
-    /// Returns the total number of alive planets.
     #[must_use]
     pub fn planet_count(&self) -> usize {
         self.adjacency.len()

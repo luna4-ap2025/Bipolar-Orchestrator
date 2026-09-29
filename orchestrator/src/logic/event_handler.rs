@@ -1,13 +1,6 @@
-//! # Incoming message handler
-//!
-//! Drains the `ExplorerToOrchestrator` channel during each logic tick and
-//! dispatches messages to the correct subsystem.
-//!
-//! Messages that arrive here are **autonomous** explorer requests (e.g. the
-//! explorer asking to travel to a neighboring planet). Manual/API-triggered
-//! messages are handled synchronously in [`crate::api`].
-//!
-//! ## Owner: Vivi
+//! Handles the messages explorers send on their own while their AI runs
+//! (asking for neighbors, asking to travel, confirming moves...). Answers to
+//! manual API calls are read in `api` instead.
 
 use crate::explorer::ExplorerRegistry;
 use crate::galaxy::Topology;
@@ -23,13 +16,9 @@ use common_game::protocols::orchestrator_planet::PlanetToOrchestrator;
 use crossbeam_channel::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 
-/// Bag content type used by the orchestrator.
-/// Must match the explorer's `ExplorerToOrchestrator<T>`.
 pub type BagContent = crate::explorer::handle::BagContent;
 
-/// Drains all pending `ExplorerToOrchestrator` messages without blocking.
-///
-/// Called frequently by the logic loop so explorers are not left waiting.
+/// Handles every message that's waiting, without blocking.
 pub fn drain_explorer_messages(
     explorer_rx: &Receiver<ExplorerToOrchestrator<BagContent>>,
     planet_rx: &Receiver<PlanetToOrchestrator>,
@@ -54,12 +43,7 @@ pub fn drain_explorer_messages(
     }
 }
 
-/// Dispatches a single explorer message to the appropriate handler.
-///
-/// Deliberately kept as one `match` over every `ExplorerToOrchestrator`
-/// variant rather than split into per-variant functions, so the full message
-/// protocol stays readable in one place; accepted against `clippy::pedantic`'s
-/// line-count threshold.
+// long, but having the whole protocol in one match is easier to read
 #[allow(clippy::too_many_lines)]
 fn handle_one(
     msg: ExplorerToOrchestrator<BagContent>,
@@ -76,11 +60,9 @@ fn handle_one(
         } => {
             log::debug!("Explorer {explorer_id} requests neighbors of planet {current_planet_id}");
 
-            // We still check that the explorer exists.
-            // But IMPORTANT:
-            // NeighborsResponse does not contain the planet id it refers to.
-            // Therefore, if the request says "planet 5", we must answer with
-            // neighbors of planet 5, not with the registry's current planet.
+            // NeighborsResponse doesn't say which planet it's about, so we
+            // answer for the planet the explorer asked about, even if our
+            // registry says it's somewhere else.
             let real_current_planet = {
                 let Ok(registry) = explorers.lock() else {
                     log::warn!(
@@ -158,9 +140,8 @@ fn handle_one(
                 handle.current_planet()
             };
 
-            // For travel requests, unlike NeighborsRequest, the registry must win.
-            // If the explorer is asking to travel from a planet that the registry
-            // does not consider current anymore, the request is stale and unsafe.
+            // Here the registry wins: if the explorer thinks it's on another
+            // planet, the request is old and moving it would break things.
             if real_current_planet != current_planet_id {
                 log::warn!(
                     "Ignoring stale TravelToPlanetRequest from explorer {explorer_id}: requested from {current_planet_id}, but registry says {real_current_planet}"
@@ -218,9 +199,7 @@ fn handle_one(
         } => {
             log::debug!("Explorer {explorer_id} confirmed arrival at planet {planet_id}");
 
-            // Optional safety check: only accept the reported planet if it still
-            // exists in topology. This avoids updating the registry to a planet
-            // that was destroyed meanwhile.
+            // the planet could have been destroyed in the meantime
             let planet_still_exists = {
                 let Ok(topo) = topology.lock() else {
                     log::warn!(
@@ -241,13 +220,9 @@ fn handle_one(
 
             if let Ok(mut registry) = explorers.lock() {
                 if let Some(handle) = registry.get_mut(explorer_id) {
-                    // Captured before the overwrite — this is the single point
-                    // (shared by both the autonomous AI path and the manual
-                    // API-triggered move) where a move actually gets confirmed,
-                    // so it's the correct place to record the real hop for the
-                    // GUI, instead of relying on it to notice a polled position
-                    // diff (which can silently miss hops faster than the ~4Hz
-                    // snapshot poll).
+                    // Every move (AI or manual) ends up here, so this is where
+                    // the GUI event is recorded. Comparing positions between
+                    // snapshots missed moves that happened too fast.
                     let from = handle.current_planet();
                     handle.set_current_planet(planet_id);
 

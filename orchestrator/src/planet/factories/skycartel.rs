@@ -1,5 +1,4 @@
-//! # Skycartel planet factory — Type A, generates Carbon
-//! ## Owner: Vale
+//! Skycartel (type A), generates Carbon.
 
 use super::PlanetFactory;
 use common_game::components::planet::Planet;

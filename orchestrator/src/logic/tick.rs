@@ -1,9 +1,5 @@
-//! # Logic tick
-//!
-//! One tick of the game loop: decides sunray vs asteroid for a single planet
-//! and handles the planet's acknowledgment (including destruction).
-//!
-//! ## Owner: Vivi
+//! Sending a sunray or an asteroid to one planet, and destroying it if it
+//! can't defend itself.
 
 use crate::ack::recv_ack;
 use crate::error::OrchestratorError;
@@ -19,30 +15,16 @@ use crossbeam_channel::Receiver;
 use rand::RngExt;
 use std::time::Duration;
 
-/// Timeout when waiting for a planet's acknowledgment.
 const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Sends either a sunray or asteroid to `planet_id` based on the probability
-/// curve, then waits for the ack.
+/// Rolls against the planet's curve, sends a sunray or an asteroid and waits
+/// for the ack. If an asteroid isn't deflected the planet is destroyed.
 ///
-/// If the asteroid is not deflected (`rocket: None`), the planet is killed:
-/// - [`OrchestratorToPlanet::KillPlanet`] is sent.
-/// - The planet is removed from `planets` and `topology`.
-/// - [`ProbabilityRegistry::on_planet_death`] is called.
-///
-/// Returns `true` if this dispatch destroyed the planet, so the caller can
-/// cap deaths at one per tick (see `logic::mod` — dispatching every alive
-/// planet unconditionally every tick let 3+ planets die in the same instant,
-/// which also crushed hostility via repeated `on_planet_death` dampening
-/// before it ever had a chance to build up).
+/// Returns `true` if the planet was destroyed. The loop stops the tick there,
+/// otherwise several planets could die at the same moment.
 ///
 /// # Errors
-/// Returns an error if a channel send/receive fails or times out.
-///
-/// Takes each shared registry as its own parameter (rather than bundling them)
-/// to keep borrow scopes minimal and explicit at each call site; this is a
-/// deliberate, accepted tradeoff against `clippy::pedantic`'s argument-count
-/// threshold.
+/// If a send fails or the ack times out.
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_to_planet(
     planet_id: ID,
@@ -70,8 +52,6 @@ pub fn dispatch_to_planet(
         prob_registry.record_event(OrchestratorEvent::SunraySent { planet_id });
         log::debug!("Sent sunray to planet {planet_id} (prob={sunray_prob:.2}, roll={roll:.2})");
 
-        // Wait for this specific planet's ack, discarding any stray messages
-        // (e.g. a straggling KillPlanetResult from a planet that just died).
         let ack_id = recv_ack(
             planet_ack_rx,
             ACK_TIMEOUT,
@@ -96,7 +76,6 @@ pub fn dispatch_to_planet(
             1.0 - sunray_prob
         );
 
-        // Wait for this specific planet's ack, discarding any stray messages.
         let (ack_id, rocket) = recv_ack(
             planet_ack_rx,
             ACK_TIMEOUT,
@@ -122,21 +101,16 @@ pub fn dispatch_to_planet(
     }
 }
 
-/// Sends [`KillPlanet`], removes the planet from all registries, and kills
-/// any explorer that was standing on it.
+/// Kills the planet, removes it everywhere, and kills any explorer that was
+/// on it (we decided explorers die with their planet instead of escaping to
+/// a neighbor).
 ///
-/// Design decision (confirmed with the team): an explorer on a planet when
-/// it's destroyed dies immediately along with it — no relocation to a
-/// neighbor. `KillExplorer` is sent and the handle is joined the same way
-/// [`crate::api::OrchestratorApi::shutdown`] kills explorers: `join()` blocks
-/// until the explorer's `run()` loop actually returns after processing
-/// `KillExplorer`, so there's no need to separately wait for
-/// `KillExplorerResult` on the shared ack channel.
+/// `join()` waits until the explorer thread really ends, so there's no need
+/// to wait for `KillExplorerResult`.
+///
 /// # Errors
-/// Currently always returns `Ok(())`; the `Result` is kept so callers (and
-/// their own error propagation via `?`) don't need to change if a future
-/// change to this function needs to fail (e.g. a channel send error that
-/// should abort the destruction instead of being silently ignored).
+/// Never fails for now. It returns a Result so callers don't have to change
+/// if it ever needs to.
 pub fn destroy_planet(
     planet_id: ID,
     planets: &mut PlanetRegistry,
@@ -145,28 +119,21 @@ pub fn destroy_planet(
     explorers: &mut ExplorerRegistry,
     rng: &mut impl rand::Rng,
 ) -> Result<(), OrchestratorError> {
-    // send kill
     if let Some(handle) = planets.get(planet_id) {
         let _ = handle.send(OrchestratorToPlanet::KillPlanet);
     }
 
-    // remove from registries
     if let Some(mut handle) = planets.remove(planet_id) {
         handle.join();
     }
 
     topology.remove_planet(planet_id);
     prob_registry.record_event(OrchestratorEvent::PlanetDestroyed { planet_id });
-    // Captured *before* on_planet_death dampens hostility — otherwise every
-    // kill logs as "Bipolar mode: Solace" regardless of which personality
-    // actually rolled the fatal asteroid, since dampening almost always pulls
-    // hostility back under the 0.5 threshold immediately. A kill that
-    // happened while hostility had crossed into Eclipse territory was being
-    // silently misattributed to Solace the instant it printed.
+    // read before on_planet_death lowers hostility, otherwise the log always
+    // says Solace even when Eclipse was the one who killed it
     let mode_at_death = prob_registry.bipolar_mode();
     prob_registry.on_planet_death(planet_id, rng);
 
-    // Kill any explorer that was stationed on the destroyed planet.
     let stranded: Vec<ID> = explorers
         .iter()
         .filter(|h| h.current_planet() == planet_id)
@@ -198,10 +165,7 @@ mod tests {
     use common_game::protocols::planet_explorer::PlanetToExplorer;
     use crossbeam_channel::unbounded;
 
-    /// Builds a bare-bones `ExplorerHandle` stationed on `planet_id`, backed
-    /// by a thread that exits immediately (mirrors what a real explorer does
-    /// right after processing `KillExplorer`) so `handle.join()` in
-    /// `destroy_planet` doesn't block the test.
+    // the thread ends right away so join() in destroy_planet doesn't block
     fn fake_explorer(id: ID, planet_id: ID) -> ExplorerHandle {
         let (tx, _rx) = unbounded::<OrchestratorToExplorer>();
         let (planet_reply_tx, _rx2) = unbounded::<PlanetToExplorer>();

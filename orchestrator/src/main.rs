@@ -1,15 +1,9 @@
-//! # Bipolar Orchestrator - entry point
+//! Command line version of the orchestrator (the GUI is in the `gui` crate).
 //!
-//! Parses CLI arguments, reads the galaxy and planet-config files, constructs
-//! the orchestrator, and hands control to the interactive API loop.
-//!
-//! ## Usage
 //! ```text
 //! bipolar-orchestrator --galaxy galaxy.txt --planets planets.toml [--auto]
 //! ```
-//! - `--galaxy <path>`  : path to the galaxy topology file (required)
-//! - `--planets <path>` : path to the planet factory config (required)
-//! - `--auto`           : immediately start the game logic without waiting for user input
+//! `--auto` starts the logic right away instead of waiting for `start`.
 
 use bipolar_orchestrator::api::OrchestratorApi;
 use bipolar_orchestrator::explorer::{ExplorerHandle, ExplorerRegistry};
@@ -26,11 +20,8 @@ use crossbeam_channel::unbounded;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-// Inline galaxy/planet/explorer setup here mirrors `builder::build_api`
-// (used by the GUI) rather than sharing it directly, since the CLI's
-// interactive setup and logging differ slightly; accepted against
-// clippy::pedantic's line-count threshold rather than forcing a shared
-// abstraction between the two entry points this close to the deadline.
+// Mostly the same as builder::build_api, but with nicer errors and logs for
+// the CLI. Could be merged some day.
 #[allow(clippy::too_many_lines)]
 fn main() {
     env_logger::init();
@@ -43,7 +34,6 @@ fn main() {
         args.planets_path.display()
     );
 
-    // ── Load galaxy topology ──────────────────────────────────────────────────
     let topology = match galaxy::parser::parse(&args.galaxy_path) {
         Ok(t) => {
             log::info!("Galaxy loaded: {} planets", t.planet_count());
@@ -55,7 +45,6 @@ fn main() {
         }
     };
 
-    // ── Load planet factory mapping ───────────────────────────────────────────
     let planet_config = match galaxy::planet_config::parse(&args.planets_path) {
         Ok(c) => {
             log::info!("Planet config loaded: {} entries", c.len());
@@ -67,7 +56,6 @@ fn main() {
         }
     };
 
-    // ── Validate that every planet in the topology has a factory entry ────────
     for id in topology.planet_ids() {
         if !planet_config.contains_key(&id) {
             eprintln!("Planet {id} is in galaxy.txt but has no entry in planets.toml");
@@ -75,7 +63,7 @@ fn main() {
         }
     }
 
-    // ── Spawn planets ───────────────────────────────────────────────────────────
+    // planets
     let (planet_tx, planet_rx) = unbounded::<PlanetToOrchestrator>();
 
     let factories: HashMap<String, Box<dyn planet::factories::PlanetFactory>> =
@@ -112,17 +100,13 @@ fn main() {
 
     log::info!("Spawned {} planets", planet_registry.count());
 
-    // ── Spawn explorers ─────────────────────────────────────────────────────────
-    // Both explorers are spawned here, mirroring `builder::build_api` (used by
-    // the GUI) — previously only Viviana was created, so the CLI's `bag 2` /
-    // `move 2 ...` etc. would always report "explorer 2 not found" because
-    // Jeb was never spawned in this entry point.
+    // explorers (same ids and starting planets as builder.rs)
     let (explorer_tx, explorer_rx) =
         unbounded::<bipolar_orchestrator::explorer::handle::ExplorerToOrchestratorMsg>();
 
     let mut explorer_registry = ExplorerRegistry::new();
 
-    // Viviana — id 1, starts on planet 4.
+    // Viviana
     {
         let (tx_to_viv, rx_from_orch) = unbounded::<OrchestratorToExplorer>();
         let (planet_reply_tx, rx_from_planet) = unbounded::<PlanetToExplorer>();
@@ -156,7 +140,7 @@ fn main() {
         log::info!("Spawned explorer 1 (Viviana) on planet 4");
     }
 
-    // Jeb — id 2, starts on planet 1.
+    // Jeb
     {
         let (tx_to_jeb, rx_from_orch) = unbounded::<OrchestratorToExplorer>();
         let (planet_reply_tx, rx_from_planet) = unbounded::<PlanetToExplorer>();
@@ -194,14 +178,12 @@ fn main() {
         log::info!("Spawned explorer 2 (Jeb) on planet 1");
     }
 
-    // ── Build probability registry and forge ────────────────────────────────────
     let mut rng = rand::rng();
 
     let prob_registry = ProbabilityRegistry::new(planet_ids.iter().copied(), &mut rng);
 
     let forge = Forge::new().expect("failed to create Forge");
 
-    // ── Build public API ────────────────────────────────────────────────────────
     let mut api = OrchestratorApi::new(
         topology,
         planet_registry,
@@ -219,18 +201,13 @@ fn main() {
     interactive_loop(&mut api);
 }
 
-/// Holds parsed CLI arguments.
 struct Args {
     galaxy_path: PathBuf,
     planets_path: PathBuf,
-    /// When true the game logic starts immediately without waiting for user input.
     auto_start: bool,
 }
 
-/// Minimal hand-rolled CLI parser.
-///
-/// # Panics
-/// Panics if `--galaxy` or `--planets` is not provided.
+// Panics if --galaxy or --planets is missing.
 fn parse_args() -> Args {
     let mut args = std::env::args().skip(1);
     let mut galaxy_path: Option<PathBuf> = None;
@@ -261,24 +238,8 @@ fn parse_args() -> Args {
     }
 }
 
-/// Blocking interactive loop that reads user commands from stdin.
-///
-/// Accepts an `OrchestratorApi` and dispatches every typed command to it.
-/// Blocks until the user types `quit` or stdin closes.
-///
-/// Available commands:
-/// - `start`                        start the game logic loop
-/// - `stop`                         stop the game logic loop
-/// - `sunray <planet_id>`           send a sunray manually
-/// - `asteroid <planet_id>`         send an asteroid manually
-/// - `move <explorer_id> <pid>`     move an explorer to a planet
-/// - `generate <explorer_id> <res>` generate a basic resource
-/// - `combine <explorer_id> <res>`  combine resources into a complex one
-/// - `bag <explorer_id>`            print the explorer bag contents
-/// - `state <planet_id>`            print planet internal state
-/// - `neighbors <planet_id>`        list neighboring planets
-/// - `planets`                      list all alive planets
-/// - `quit`                         gracefully shut down
+// Reads commands from stdin until `quit` (list in api/commands.rs, or type
+// `help`).
 fn interactive_loop(api: &mut bipolar_orchestrator::api::OrchestratorApi) {
     use bipolar_orchestrator::api::commands::{self, Command};
     use std::io::{self, BufRead};
@@ -294,7 +255,6 @@ fn interactive_loop(api: &mut bipolar_orchestrator::api::OrchestratorApi) {
             continue;
         }
 
-        // parse the raw string into a typed Command
         let cmd = match commands::parse(&line) {
             Ok(c) => c,
             Err(e) => {

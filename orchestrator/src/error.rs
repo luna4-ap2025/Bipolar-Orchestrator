@@ -1,27 +1,18 @@
-//! # Error types for the Bipolar Orchestrator
-//!
-//! All fallible orchestrator operations return [`OrchestratorError`].
-
 use common_game::utils::ID;
 use std::fmt;
 
-/// Unified error type for all orchestrator operations.
 #[derive(Debug)]
 pub enum OrchestratorError {
-    /// The galaxy initialization file could not be read or parsed.
+    /// galaxy.txt or planets.toml couldn't be read or parsed
     GalaxyFileError(String),
-    /// A planet with the given ID was not found in the galaxy.
     PlanetNotFound(ID),
-    /// An explorer with the given ID was not found.
     ExplorerNotFound(ID),
-    /// The destination planet is not a neighbor of the current planet.
     NotANeighbor { from: ID, to: ID },
-    /// A channel send/receive operation failed (the other end disconnected).
+    /// A send failed, the other side disconnected, or an ack timed out.
     ChannelError(String),
-    /// The game logic is already running when `start_logic` was called, or
-    /// already stopped when `stop_logic` was called.
+    /// `start_logic` while already running, or `stop_logic` while stopped.
     InvalidState(String),
-    /// A planet factory function returned an error during construction.
+    /// A planet's factory returned an error.
     PlanetConstructionError(String),
 }
 

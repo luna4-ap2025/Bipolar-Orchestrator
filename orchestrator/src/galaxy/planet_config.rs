@@ -1,30 +1,22 @@
-//! # Planet factory configuration
-//!
-//! Parses `planets.toml` into a map of `planet_id -> factory_name`.
-//! The orchestrator uses this to know which group's planet crate to
-//! instantiate for each planet id in the topology.
-//!
-//! Format:
+//! Reads planets.toml, which says which group's planet goes on each id:
 //! ```toml
 //! [planets]
 //! 1 = "orbitron"
 //! 2 = "rustrelli"
 //! ```
-//! Lines starting with `#` are ignored. The `[planets]` section header is required.
+//! It's not real TOML parsing, just this simple format. The `[planets]` line
+//! is required, `#` lines are skipped.
 
 use crate::error::OrchestratorError;
 use common_game::utils::ID;
 use std::collections::HashMap;
 use std::path::Path;
 
-/// Maps planet ids to factory names as read from `planets.toml`.
+/// planet id -> factory name
 pub type PlanetConfigMap = HashMap<ID, String>;
 
-/// Parses the planet config file at `path`.
-///
 /// # Errors
-/// [`OrchestratorError::GalaxyFileError`] if the file cannot be read, or if
-/// its contents fail to parse (see [`parse_str`]).
+/// `GalaxyFileError` if the file can't be read or parsed (see [`parse_str`]).
 pub fn parse(path: impl AsRef<Path>) -> Result<PlanetConfigMap, OrchestratorError> {
     let content = std::fs::read_to_string(path.as_ref()).map_err(|e| {
         OrchestratorError::GalaxyFileError(format!(
@@ -35,11 +27,9 @@ pub fn parse(path: impl AsRef<Path>) -> Result<PlanetConfigMap, OrchestratorErro
     parse_str(&content)
 }
 
-/// Parses planet config from a string.
-///
 /// # Errors
-/// [`OrchestratorError::GalaxyFileError`] if the `[planets]` section header is
-/// missing, or if any `<id> = "<name>"` assignment line is malformed.
+/// `GalaxyFileError` if `[planets]` is missing or a line isn't
+/// `<id> = "<name>"`.
 pub fn parse_str(content: &str) -> Result<PlanetConfigMap, OrchestratorError> {
     let mut map = PlanetConfigMap::new();
     let mut in_planets_section = false;

@@ -1,11 +1,5 @@
-//! # Bipolar mode label
-//!
-//! `BipolarMode` is a *derived* label for which orchestrator personality is
-//! dominant right now — it no longer drives probability math directly. The
-//! real driver is [`super::ProbabilityRegistry`]'s continuous `hostility`
-//! value; this enum just buckets that value into SOLACE (< 0.5, nurturing,
-//! sunray-biased) or ECLIPSE (>= 0.5, destructive, asteroid-biased) for logs
-//! and GUI text.
+//! Which personality is in control. It's only a label (for logs and the GUI),
+//! the probabilities use `hostility` directly.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BipolarMode {
@@ -14,7 +8,7 @@ pub enum BipolarMode {
 }
 
 impl BipolarMode {
-    /// Buckets a continuous hostility value in `[0.0, 1.0]` into a dominant label.
+    /// Eclipse from 0.5 up, Solace below.
     #[must_use]
     pub fn from_hostility(hostility: f64) -> Self {
         if hostility >= 0.5 {
@@ -24,7 +18,6 @@ impl BipolarMode {
         }
     }
 
-    /// Returns `true` if ECLIPSE is currently dominant.
     #[must_use]
     pub fn is_eclipse(self) -> bool {
         matches!(self, Self::Eclipse)

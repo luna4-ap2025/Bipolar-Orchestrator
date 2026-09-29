@@ -1,16 +1,10 @@
-//! # Planet factories
+//! Every group builds their planet in a different way, so each one gets a
+//! small wrapper implementing [`PlanetFactory`] and the spawner doesn't care
+//! which planet it is.
 //!
-//! Each external planet repo exposes a function (or type) for constructing its
-//! planet. This module provides a common [`PlanetFactory`] trait so the spawner
-//! can call any planet without knowing its concrete type.
-//!
-//! ## How to add a new planet
-//! 1. Add the git dependency to `Cargo.toml`.
-//! 2. Create `factories/<name>.rs` implementing [`PlanetFactory`].
-//! 3. Add a `pub mod <name>` here.
-//! 4. Register the factory in [`all_factories`].
-//!
-//! ## Owner: Vale (one factory file per external planet)
+//! Adding a planet: add its git dependency in Cargo.toml, make a file here
+//! that implements `PlanetFactory`, add the `pub mod`, and add it to
+//! [`all_factories`].
 
 use common_game::components::planet::Planet;
 use common_game::protocols::orchestrator_planet::PlanetToOrchestrator;
@@ -26,19 +20,14 @@ pub mod rustrelli;
 pub mod skycartel;
 pub mod thecompilerstrikesback;
 
-/// Factory trait implemented once per external planet crate.
-///
-/// The orchestrator calls [`PlanetFactory::create`] to build the planet and
-/// then immediately spawns it in a thread.
 pub trait PlanetFactory: Send + Sync {
-    /// Returns the human-readable name of this planet (group name).
+    /// The group's name.
     fn name(&self) -> &'static str;
 
-    /// Constructs the planet, wiring it to the provided channels.
+    /// Builds the planet with the given channels.
     ///
     /// # Errors
-    /// Returns a descriptive error string if construction fails (e.g. invalid
-    /// parameters for the planet type constraints).
+    /// If the group's constructor fails.
     fn create(
         &self,
         id: ID,
@@ -50,7 +39,6 @@ pub trait PlanetFactory: Send + Sync {
     ) -> Result<Planet, String>;
 }
 
-/// Returns one factory instance per external planet.
 #[must_use]
 pub fn all_factories() -> Vec<Box<dyn PlanetFactory>> {
     vec![

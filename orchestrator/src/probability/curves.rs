@@ -1,54 +1,35 @@
-//! # Probability curves
+//! The curves each planet can get. A curve gives a "wobble" between 0 and 1
+//! over time (1 = sunray, 0 = asteroid), so every planet has its own rhythm.
 //!
-//! Each [`CurveKind`] maps phase time `t` (seconds since the last planet
-//! death) to a local "wobble" value in `[0.0, 1.0]` — this is each planet's
-//! own personality, independent of the galaxy's mood.
+//! Hostility then mixes the wobble with its opposite: at 0 the curve is used
+//! as it is, at 1 it's flipped, in between it's a lerp. So planets keep their
+//! own shape but everything leans toward asteroids as hostility goes up.
 //!
-//! That wobble is then blended against its own inverse by the registry's
-//! global `hostility` value (see [`super::ProbabilityRegistry`]): at
-//! `hostility = 0.0` the curve reads as-is (calm), at `hostility = 1.0` it
-//! reads fully inverted (hostile), and in between it's a straight lerp. So
-//! every planet keeps its individual shape while the whole galaxy leans
-//! further toward asteroids as hostility climbs.
-//!
-//! | Kind          | t=0 wobble | Shape                            |
-//! |---------------|------------|-----------------------------------|
-//! | `Sine`        | 0.5        | smooth oscillation, neutral open |
-//! | `Cosine`      | 1.0        | smooth oscillation, full open    |
-//! | `Sawtooth`    | 1.0        | linear fall then hard reset      |
-//! | `Triangle`    | 1.0        | falls then rises, symmetric      |
-//! | `Square`      | 1.0        | hard binary alternation          |
-//! | `Exponential` | 1.0        | decays toward 0, no recovery     |
-//! | `Staircase`   | 1.0        | 4 discrete steps down, then reset|
+//! | Kind          | at t=0 | Shape                                |
+//! |---------------|--------|--------------------------------------|
+//! | `Sine`        | 0.5    | smooth wave                          |
+//! | `Cosine`      | 1.0    | smooth wave                          |
+//! | `Sawtooth`    | 1.0    | goes down in a line, then jumps back |
+//! | `Triangle`    | 1.0    | goes down, then back up              |
+//! | `Square`      | 1.0    | 1 for half the period, then 0        |
+//! | `Exponential` | 1.0    | decays toward 0 and stays there      |
+//! | `Staircase`   | 1.0    | 4 steps down, then back to the top   |
 
-// Scaled alongside `logic::TICK_INTERVAL` every time that constant changed
-// (1s -> 4s -> 25s) so curves keep swinging over the same number of *ticks*,
-// just spread over more real time: 40 -> 160 -> 1000.
+// In seconds. Changed together with TICK_INTERVAL (now 25s) so a curve still
+// takes about the same number of ticks to go around.
 const PERIOD: f64 = 1000.0;
 const DECAY_K: f64 = 0.0125;
 
-// Angular frequency for Sine/Cosine so they complete one full cycle every
-// `PERIOD` seconds, matching Sawtooth/Triangle/Square. Raw `t.sin()`/`t.cos()`
-// (frequency 1 rad/s) would instead cycle every ~6.28s regardless of `PERIOD`,
-// making a Sine/Cosine planet's odds swing almost randomly between ticks.
+// so Sine/Cosine also do one cycle per PERIOD (plain sin(t) repeats every
+// ~6s, which basically made them random from tick to tick)
 const ANGULAR_FREQ: f64 = std::f64::consts::TAU / PERIOD;
 
-/// Floor on a curve's raw wobble value. Sawtooth/Triangle/Square/Exponential
-/// all legitimately reach `0.0` wobble (guaranteed asteroid) somewhere in
-/// their own period — regardless of `hostility`. With 7 planets each on an
-/// independent phase of the same clock, that made games end in well under a
-/// minute even right after the hostility-ramp slowdown, because the ramp
-/// only controls how *hostile* things get, not this per-curve floor. Only
-/// clamps the low (dangerous) side — at `hostility = 1.0` curves still
-/// invert down to `0.0`, which is the intended "everything is lethal in full
-/// Eclipse" behavior.
-///
-/// Raised from 0.3 to 0.45 after a real playtest log showed *ordinary*
-/// (non-floor, mid-curve) values in the 40-60% asteroid-chance range were
-/// still enough to wipe out 7 independently-rolling planets in under 30
-/// seconds of real dispatching. `TICK_INTERVAL` was also raised (see
-/// `logic::mod`) since roll *frequency* was the bigger lever, but a higher
-/// floor keeps "ordinary" risk lower too.
+// Most curves hit 0 at some point, which is a guaranteed asteroid even when
+// hostility is 0, and games were ending in under a minute. The floor only
+// applies to the wobble, so at full hostility curves still flip all the way
+// down to 0 (full Eclipse is supposed to be deadly).
+// Was 0.3, raised to 0.45 because even 40-60% asteroid chances wiped out all
+// 7 planets really fast.
 const WOBBLE_FLOOR: f64 = 0.45;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -87,9 +68,7 @@ pub struct ProbabilityCurve {
 }
 
 impl ProbabilityCurve {
-    /// Sunray probability at `t` seconds into the current phase, blended
-    /// against its own inverse by `hostility` (`0.0` = pure wobble, `1.0` =
-    /// fully inverted).
+    /// Sunray probability at `t` seconds for the given hostility.
     #[must_use]
     pub fn evaluate(&self, t: f64, hostility: f64) -> f64 {
         let wobble = self.evaluate_wobble(t).max(WOBBLE_FLOOR);
@@ -98,19 +77,16 @@ impl ProbabilityCurve {
 
     fn evaluate_wobble(&self, t: f64) -> f64 {
         match self.kind {
-            // (sin(t) + 1) / 2 — oscillates [0, 1] once per PERIOD, starts at 0.5
+            // (sin + 1) / 2 so it stays in 0..1
             CurveKind::Sine => f64::midpoint((t * ANGULAR_FREQ).sin(), 1.0),
 
-            // (cos(t) + 1) / 2 — oscillates [0, 1] once per PERIOD, starts at 1.0
             CurveKind::Cosine => f64::midpoint((t * ANGULAR_FREQ).cos(), 1.0),
 
-            // 1 - (t mod T) / T — linear fall from 1.0 to 0.0, then hard reset
             CurveKind::Sawtooth => {
                 let phase = t % PERIOD;
                 1.0 - phase / PERIOD
             }
 
-            // Falls 1->0 in first half-period, rises 0->1 in second half
             CurveKind::Triangle => {
                 let phase = t % PERIOD;
                 let half = PERIOD / 2.0;
@@ -121,19 +97,15 @@ impl ProbabilityCurve {
                 }
             }
 
-            // 1.0 for first half-period, 0.0 for second — no middle ground
             CurveKind::Square => {
                 let phase = t % PERIOD;
                 if phase < PERIOD / 2.0 { 1.0 } else { 0.0 }
             }
 
-            // e^(-k*t) — starts at 1.0, decays toward 0 with no recovery.
-            // Uses phase_elapsed so it always resets to 1.0 on planet death.
+            // e^(-kt), never comes back up (the floor stops it at 0.45)
             CurveKind::Exponential => (-DECAY_K * t).exp(),
 
-            // 4 discrete steps (1.0, 0.75, 0.5, 0.25) over the period, then
-            // hard reset — like Square but with more, smaller ledges instead
-            // of one binary flip.
+            // 1.0, 0.75, 0.5, 0.25, then back to 1.0
             CurveKind::Staircase => {
                 let phase = t % PERIOD;
                 let step = (phase / (PERIOD / 4.0)).floor();
@@ -241,9 +213,8 @@ mod tests {
         assert!((c.evaluate(0.0, 0.0) - 1.0).abs() < 1e-10);
         assert!((c.evaluate(quarter, 0.0) - 0.75).abs() < 1e-10);
         assert!((c.evaluate(quarter * 2.0, 0.0) - 0.5).abs() < 1e-10);
-        // Raw step is 0.25, but WOBBLE_FLOOR clamps it up to 0.3.
+        // last step is 0.25, but the floor raises it
         assert!((c.evaluate(quarter * 3.0, 0.0) - WOBBLE_FLOOR).abs() < 1e-10);
-        // Wraps back to the top after a full period.
         assert!((c.evaluate(PERIOD, 0.0) - 1.0).abs() < 1e-10);
     }
 

@@ -1,40 +1,23 @@
-//! # Planet handle
-//!
-//! [`PlanetHandle`] is the orchestrator's view of a live planet.
-//! It holds the sender used to send messages to the planet thread and
-//! any metadata the orchestrator needs to track per planet.
-//!
-//! ## Owner: Vivi
+//! What the orchestrator keeps for each planet: the sender to its thread and
+//! the sender explorers use to talk to it.
 
 use common_game::protocols::orchestrator_planet::OrchestratorToPlanet;
 use common_game::protocols::planet_explorer::ExplorerToPlanet;
 use common_game::utils::ID;
 use crossbeam_channel::Sender;
 
-/// The orchestrator's bookkeeping for one live planet.
 pub struct PlanetHandle {
-    /// Stable identifier of this planet.
     id: ID,
-    /// Sender used to deliver messages to the planet thread.
-    /// There is one dedicated sender per planet (the planet owns the receiver).
     sender: Sender<OrchestratorToPlanet>,
-    /// Name/label for display (e.g. the group name).
+    // group name, for logs
     label: String,
-    /// The single shared receiver-end sender for explorers → planet.
-    ///
-    /// When the orchestrator moves an explorer onto this planet it clones this
-    /// sender and passes it to the explorer via [`OrchestratorToExplorer::MoveToPlanet`].
+    // cloned and given to each explorer that moves here
     explorer_tx: Sender<ExplorerToPlanet>,
-    /// Join handle for the planet thread, used during shutdown.
-    ///
-    /// Wrapped in `Option` so we can `take()` it once during `join`.
+    // Option so join() can take it
     thread_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PlanetHandle {
-    /// Constructs a new `PlanetHandle`.
-    ///
-    /// Called by [`super::spawner::spawn_planet`] after the planet thread is started.
     pub fn new(
         id: ID,
         label: impl Into<String>,
@@ -51,38 +34,30 @@ impl PlanetHandle {
         }
     }
 
-    /// Returns the planet's unique ID.
     #[must_use]
     pub fn id(&self) -> ID {
         self.id
     }
 
-    /// Returns the planet's display label.
     #[must_use]
     pub fn label(&self) -> &str {
         &self.label
     }
 
-    /// Sends a message to the planet thread.
-    ///
     /// # Errors
-    /// Returns an error string if the planet thread has disconnected.
+    /// If the planet thread is gone.
     pub fn send(&self, msg: OrchestratorToPlanet) -> Result<(), String> {
         self.sender
             .send(msg)
             .map_err(|_| format!("Planet {} disconnected", self.id))
     }
 
-    /// Returns a clone of the sender used to deliver explorer messages to this
-    /// planet. Given to an explorer when it moves to this planet.
     #[must_use]
     pub fn explorer_sender(&self) -> Sender<ExplorerToPlanet> {
         self.explorer_tx.clone()
     }
 
-    /// Waits for the planet thread to finish.
-    ///
-    /// Should be called after sending [`OrchestratorToPlanet::KillPlanet`].
+    /// Send `KillPlanet` first, otherwise this waits forever.
     pub fn join(&mut self) {
         if let Some(handle) = self.thread_handle.take()
             && let Err(e) = handle.join()

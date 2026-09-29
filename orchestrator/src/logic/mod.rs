@@ -1,21 +1,11 @@
-//! # Game logic controller
+//! The logic loop, running in its own thread:
+//! - every 0.7s it handles the messages explorers send on their own
+//!   (neighbors, travel, move confirmations...)
+//! - every 25s it does a planet tick: each planet gets a sunray or an
+//!   asteroid depending on its curve, and a planet with no rocket is destroyed
+//!   (see `tick.rs`)
 //!
-//! The **logic loop** is the autonomous heartbeat of the game. Once started it
-//! runs in a dedicated background thread and:
-//!
-//! 1. Continuously drains autonomous explorer messages at a short polling interval.
-//! 2. Every [`TICK_INTERVAL`], advances probability and dispatches one game tick.
-//! 3. For each alive planet, rolls a die against its probability curve and sends
-//!    either a [`Sunray`] or an [`Asteroid`].
-//! 4. Waits for the planet's acknowledgment.
-//! 5. If an [`AsteroidAck`] carries `rocket: None`, the planet is destroyed:
-//!    - Sends [`KillPlanet`] and removes it from all registries.
-//!    - Notifies the [`ProbabilityRegistry`] to trigger the bipolar flip.
-//!    - Notifies the [`Topology`] to remove the dead planet.
-//! 6. Can be stopped and restarted at any time via [`LogicController::stop`] /
-//!    [`LogicController::start`].
-//!
-//! ## Owner: Vivi
+//! It stops when asked to, or when all the explorers are dead.
 
 pub mod event_handler;
 pub mod tick;
@@ -34,36 +24,25 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// How often the probability/asteroid/sunray game tick runs.
+// was 4s, but planets rolled so often that games were over way too fast
 const TICK_INTERVAL: Duration = Duration::from_secs(25);
 
-/// How often the logic loop checks autonomous explorer messages.
-///
-/// This must be much shorter than `TICK_INTERVAL`: explorers may ask for
-/// neighbors, travel, or send move confirmations at any time. If we only read
-/// their channel once every 25 seconds, explorers time out and retry even
-/// though the orchestrator is alive.
+// Has to be much shorter than TICK_INTERVAL: if explorers only got an answer
+// every 25s they'd time out and retry.
 const MESSAGE_POLL_INTERVAL: Duration = Duration::from_millis(700);
 
-/// Signal sent to the logic thread to control it.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum ControlSignal {
     Stop,
 }
 
-/// Controls the autonomous game logic thread.
-///
-/// [`LogicController::start`] launches a background thread. [`LogicController::stop`]
-/// sends a stop signal and waits for it to finish.
 pub struct LogicController {
-    /// Channel end for sending stop signals to the logic thread.
+    // Some while running
     control_tx: Option<Sender<ControlSignal>>,
-    /// Join handle for the background thread.
     thread_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl LogicController {
-    /// Creates a new stopped controller.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -72,23 +51,16 @@ impl LogicController {
         }
     }
 
-    /// Returns `true` if the logic loop is currently running.
     #[must_use]
     pub fn is_running(&self) -> bool {
         self.control_tx.is_some()
     }
 
-    /// Starts the logic loop in a background thread.
-    ///
-    /// The loop has access to the shared game state via `Arc<Mutex<...>>` wrappers.
+    /// Starts the logic loop thread.
     ///
     /// # Errors
-    /// Returns [`OrchestratorError::InvalidState`] if already running.
-    ///
-    /// Takes each shared registry as its own `Arc<Mutex<_>>` parameter (rather
-    /// than bundling them into a struct) to mirror `OrchestratorApi`'s own
-    /// field layout one-to-one; this is a deliberate, accepted tradeoff
-    /// against `clippy::pedantic`'s argument-count threshold.
+    /// `InvalidState` if it's already running.
+    // same arguments as the fields of OrchestratorApi, so there are many
     #[allow(clippy::too_many_arguments)]
     pub fn start(
         &mut self,
@@ -132,17 +104,17 @@ impl LogicController {
         Ok(())
     }
 
-    /// Stops the logic loop and waits for the thread to finish.
+    /// Stops the loop and waits for the thread to end.
     ///
     /// # Errors
-    /// Returns [`OrchestratorError::InvalidState`] if not running.
+    /// `InvalidState` if it isn't running.
     pub fn stop(&mut self) -> Result<(), OrchestratorError> {
         let tx = self
             .control_tx
             .take()
             .ok_or_else(|| OrchestratorError::InvalidState("Logic is not running".to_string()))?;
 
-        // Send stop signal. It is fine if it fails: the thread may have exited already.
+        // can fail if the thread already ended (game over), that's fine
         let _ = tx.send(ControlSignal::Stop);
 
         if let Some(handle) = self.thread_handle.take()
@@ -163,21 +135,7 @@ impl Default for LogicController {
     }
 }
 
-/// The main body of the logic loop thread.
-///
-/// Runs until a [`ControlSignal::Stop`] is received, all planets are destroyed,
-/// or all explorers are dead.
-///
-/// Important behavior:
-/// - explorer messages are drained every [`MESSAGE_POLL_INTERVAL`];
-/// - probability/asteroid/sunray ticks run only every [`TICK_INTERVAL`].
-///
-/// Takes owned `Arc<Mutex<_>>` clones (not references) by design: this
-/// function is spawned into its own thread, which requires `'static` owned
-/// handles to move into the closure — `clippy::pedantic`'s
-/// `needless_pass_by_value` doesn't account for that requirement. It also
-/// mirrors `OrchestratorApi`'s field layout one-to-one, hence the argument
-/// count.
+// The Arcs are taken by value because they're moved into the thread.
 #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn run_logic_loop(
     topology: Arc<Mutex<Topology>>,
@@ -191,11 +149,10 @@ fn run_logic_loop(
 ) {
     let mut rng = rand::rng();
 
-    // Run the first planet tick immediately after startup, then every 25 seconds.
+    // first tick right away
     let mut next_tick_at = Instant::now();
 
     loop {
-        // Check if we got a stop signal.
         match control_rx.try_recv() {
             Ok(ControlSignal::Stop) | Err(TryRecvError::Disconnected) => {
                 log::info!("Logic loop: stop signal received");
@@ -205,7 +162,6 @@ fn run_logic_loop(
             Err(TryRecvError::Empty) => {}
         }
 
-        // Drain autonomous explorer messages frequently.
         {
             let explorer_rx_guard = explorer_rx.lock().unwrap();
             let planet_rx_guard = planet_rx.lock().unwrap();
@@ -220,13 +176,12 @@ fn run_logic_loop(
             );
         }
 
-        // Game's end condition: stop once every explorer has died.
+        // game over
         if explorers.lock().unwrap().is_empty() {
             log::info!("All explorers have died - game over, logic loop exiting");
             break;
         }
 
-        // Run probability/planet tick only when its interval expires.
         if Instant::now() >= next_tick_at {
             run_planet_tick(
                 &topology,
@@ -241,8 +196,7 @@ fn run_logic_loop(
             next_tick_at = Instant::now() + TICK_INTERVAL;
         }
 
-        // Check again after the planet tick, because a planet death may have
-        // killed the last explorer.
+        // again, a planet dying can kill the last explorer
         if explorers.lock().unwrap().is_empty() {
             log::info!("All explorers have died - game over, logic loop exiting");
             break;
@@ -252,7 +206,6 @@ fn run_logic_loop(
     }
 }
 
-/// Runs one probability/asteroid/sunray tick over the currently alive planets.
 fn run_planet_tick(
     topology: &Arc<Mutex<Topology>>,
     planets: &Arc<Mutex<PlanetRegistry>>,
@@ -262,14 +215,12 @@ fn run_planet_tick(
     forge: &Arc<Mutex<Forge>>,
     rng: &mut impl rand::Rng,
 ) {
-    // Advance the probability curves by one tick worth of time.
     let delta = TICK_INTERVAL.as_secs_f64();
 
     if let Ok(mut prob) = prob_registry.lock() {
         prob.tick(delta);
     }
 
-    // Snapshot alive planet IDs while holding the topology lock, then release it.
     let planet_ids: Vec<_> = {
         let topo = topology.lock().unwrap();
         topo.planet_ids().collect()
@@ -280,8 +231,7 @@ fn run_planet_tick(
         return;
     }
 
-    // For each alive planet, roll the dice and send sunray or asteroid.
-    // Stop as soon as one planet dies this tick.
+    // at most one planet dies per tick, so the galaxy doesn't collapse at once
     for planet_id in planet_ids {
         let mut prob = prob_registry.lock().unwrap();
         let mut planets_guard = planets.lock().unwrap();

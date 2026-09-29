@@ -1,20 +1,13 @@
-//! # Explorer move protocol
+//! Moving an explorer, following "Moving to another planet" in the common
+//! crate's `MESSAGE_DIAGRAMS.md`:
+//! 1. `OutgoingExplorerRequest` to the current planet, wait for the response
+//! 2. `IncomingExplorerRequest` to the destination (with the explorer's
+//!    sender so the planet can answer it), wait for the response
+//! 3. `MoveToPlanet` to the explorer, with the destination planet's sender
 //!
-//! Implements the planet-side move sequence described in the project spec
-//! and in `MESSAGE_DIAGRAMS.md` ("Moving to another planet").
-//!
-//! ## Steps
-//! 1. `OutgoingExplorerRequest` → current planet → wait for `OutgoingExplorerResponse`.
-//! 2. `IncomingExplorerRequest` → destination planet, passing the explorer's
-//!    dedicated `Sender<PlanetToExplorer>` → wait for `IncomingExplorerResponse`.
-//! 3. `MoveToPlanet` → explorer, passing the destination planet's
-//!    `ExplorerToPlanet` sender.
-//!
-//! Important design note:
-//! With one shared `ExplorerToOrchestrator` channel, this file must NOT wait
-//! directly for `MovedToPlanetResult`, because another explorer's autonomous
-//! message may arrive first. `MovedToPlanetResult` is handled later by
-//! `logic::event_handler`, using `explorer_id`.
+//! We don't wait for `MovedToPlanetResult` here. All explorers share one
+//! channel, so the other explorer's messages can arrive first. The event
+//! handler deals with it instead.
 
 use crate::ack::recv_ack;
 use crate::error::OrchestratorError;
@@ -32,24 +25,15 @@ use std::time::Duration;
 
 const MOVE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Executes the planet-side move protocol.
-///
-/// This function validates the move, tells the current planet that the explorer
-/// is leaving, tells the destination planet that the explorer is arriving, and
-/// finally sends `MoveToPlanet` to the explorer.
-///
-/// It does NOT wait for `MovedToPlanetResult`.
-/// That message is processed asynchronously by `logic::event_handler`.
+/// Runs the 3 steps above.
 ///
 /// # Errors
-/// - [`OrchestratorError::NotANeighbor`] if `dst` is not adjacent to `current`.
-/// - [`OrchestratorError::PlanetNotFound`] if either planet does not exist.
-/// - [`OrchestratorError::ExplorerNotFound`] if the explorer does not exist.
-/// - [`OrchestratorError::ChannelError`] if any planet ack times out or a send fails.
+/// - `NotANeighbor` if the destination isn't next to the current planet
+/// - `PlanetNotFound` / `ExplorerNotFound`
+/// - `ChannelError` if a send fails or a planet doesn't answer in time
 ///
 /// # Panics
-/// If the topology, planet registry, or explorer registry mutex is poisoned
-/// (a prior panic occurred while another thread held the lock).
+/// If a mutex is poisoned.
 pub fn execute(
     explorer_id: ID,
     current_planet_id: ID,
@@ -59,7 +43,6 @@ pub fn execute(
     explorers: &Arc<Mutex<ExplorerRegistry>>,
     planet_ack_rx: &Receiver<PlanetToOrchestrator>,
 ) -> Result<(), OrchestratorError> {
-    // Validate the move is topologically legal.
     {
         let topo = topology.lock().unwrap();
 
@@ -71,8 +54,7 @@ pub fn execute(
         }
     }
 
-    // ── Step 1 ────────────────────────────────────────────────────────────────
-    // Tell the CURRENT planet that the explorer is leaving.
+    // 1. current planet: the explorer is leaving
     {
         let planets = planets.lock().unwrap();
 
@@ -87,10 +69,7 @@ pub fn execute(
 
     wait_for_outgoing_ack(planet_ack_rx, current_planet_id, explorer_id)?;
 
-    // ── Step 2 ────────────────────────────────────────────────────────────────
-    // Tell the DESTINATION planet that the explorer is arriving.
-    // We pass the explorer's dedicated Sender<PlanetToExplorer>, so the planet
-    // can reply directly to that explorer.
+    // 2. destination planet: the explorer is arriving
     let planet_reply_tx = {
         let explorers = explorers.lock().unwrap();
 
@@ -117,9 +96,7 @@ pub fn execute(
 
     wait_for_incoming_ack(planet_ack_rx, dst_planet_id, explorer_id)?;
 
-    // ── Step 3 ────────────────────────────────────────────────────────────────
-    // Tell the EXPLORER to switch to the new planet.
-    // We give it the destination planet's ExplorerToPlanet sender.
+    // 3. explorer: switch to the new planet
     let dst_explorer_tx = {
         let planets = planets.lock().unwrap();
 
@@ -151,8 +128,6 @@ pub fn execute(
 
     Ok(())
 }
-
-// ── Private helpers ────────────────────────────────────────────────────────────
 
 fn wait_for_outgoing_ack(
     rx: &Receiver<PlanetToOrchestrator>,
@@ -228,7 +203,7 @@ mod tests {
         let result = execute(
             42, // explorer_id
             1,  // current_planet_id
-            3,  // dst_planet_id — NOT a neighbor of 1
+            3,  // dst_planet_id, not a neighbor of 1
             &topo, &planets, &explorers, &planet_rx,
         );
 

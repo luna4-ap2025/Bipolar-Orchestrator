@@ -1,5 +1,4 @@
-//! # Crabtorio planet factory (crate name: `planet`)
-//! ## Owner: Vale
+//! Crabtorio (the crate is just called `planet`).
 
 use super::PlanetFactory;
 use common_game::components::planet::Planet;

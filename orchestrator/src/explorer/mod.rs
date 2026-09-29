@@ -1,8 +1,4 @@
-//! # Explorer manager
-//!
-//! Owns the live set of [`ExplorerHandle`]s.
-//!
-//! ## Owner: Vivi
+//! The explorers that are still alive.
 
 pub mod handle;
 
@@ -11,13 +7,11 @@ pub use handle::ExplorerHandle;
 use common_game::utils::ID;
 use std::collections::HashMap;
 
-/// Owns all currently alive explorer handles.
 pub struct ExplorerRegistry {
     handles: HashMap<ID, ExplorerHandle>,
 }
 
 impl ExplorerRegistry {
-    /// Creates an empty registry.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -25,34 +19,28 @@ impl ExplorerRegistry {
         }
     }
 
-    /// Inserts a newly spawned explorer handle.
     pub fn insert(&mut self, handle: ExplorerHandle) {
         self.handles.insert(handle.id(), handle);
     }
 
-    /// Returns an immutable reference to the handle for `explorer_id`.
     #[must_use]
     pub fn get(&self, explorer_id: ID) -> Option<&ExplorerHandle> {
         self.handles.get(&explorer_id)
     }
 
-    /// Returns a mutable reference to the handle for `explorer_id`.
     pub fn get_mut(&mut self, explorer_id: ID) -> Option<&mut ExplorerHandle> {
         self.handles.get_mut(&explorer_id)
     }
 
-    /// Removes and returns the handle for `explorer_id`.
     pub fn remove(&mut self, explorer_id: ID) -> Option<ExplorerHandle> {
         self.handles.remove(&explorer_id)
     }
 
-    /// Iterates over all live explorer handles.
     pub fn iter(&self) -> impl Iterator<Item = &ExplorerHandle> {
         self.handles.values()
     }
 
-    /// Returns `true` if no explorers remain — the game's end condition
-    /// (spec §1.3: "when no Explorer remains, the game ends").
+    /// No explorers left means the game is over (spec 1.3).
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.handles.is_empty()

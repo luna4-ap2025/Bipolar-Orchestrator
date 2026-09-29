@@ -1,5 +1,4 @@
-//! # Rustrelli planet factory — Type D, generates all 4 basic resources
-//! ## Owner: Vale
+//! Rustrelli (type D), generates all 4 basic resources.
 
 use super::PlanetFactory;
 use common_game::components::planet::Planet;
@@ -22,7 +21,7 @@ impl PlanetFactory for RustrelliFatory {
         tx_to_orchestrator: Sender<PlanetToOrchestrator>,
         rx_from_explorers: Receiver<ExplorerToPlanet>,
     ) -> Result<Planet, String> {
-        // ExplorerRequestLimit::None — no artificial throttling on explorer requests
+        // no limit on explorer requests
         Ok(rustrelli::create_planet(
             id,
             rx_from_orchestrator,

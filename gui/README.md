@@ -46,7 +46,7 @@ The idea behind our orchestrator is that the galaxy is ruled by a single entity 
 - **Solace** (gold): the nurturing side. She prefers sending **sunrays**, which charge the planets' energy cells.
 - **Eclipse** (purple): the destructive side. She prefers sending **asteroids**, which can destroy planets that have no rocket.
 
-Which one is in control depends on a global **hostility** value between 0 and 1. It slowly rises over time, and at 0.5 control flips from Solace to Eclipse. When a planet is destroyed, hostility drops back to 0, so the galaxy gets a calm period before the danger builds again. That's the "bipolar" in the name.
+Which one is in control depends on a global **hostility** value between 0 and 1. It slowly rises over time, and at 0.5 control flips from Solace to Eclipse. Every time a planet is destroyed, hostility drops a little, giving the galaxy a short breather before the danger keeps building. That's the "bipolar" in the name.
 
 The visualizer is designed around this story:
 
